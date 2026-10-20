@@ -12,6 +12,11 @@ class EMSKnowledgeBase:
     def __init__(self, doc_paths: Optional[List[str]] = None):
         if doc_paths is None:
             self.doc_paths = [settings.REFERENCE_DOC_PATH, "EMS_DATA_COMPONENTS_AND_RULES.md"]
+            components_dir = "docs/components"
+            if os.path.exists(components_dir):
+                for f in sorted(os.listdir(components_dir)):
+                    if f.endswith(".md"):
+                        self.doc_paths.append(os.path.join(components_dir, f))
         else:
             self.doc_paths = doc_paths
         self.sections: List[Dict[str, str]] = []
