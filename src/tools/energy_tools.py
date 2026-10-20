@@ -103,6 +103,34 @@ def diagnose_high_consumption(date: str) -> Dict[str, Any]:
     return RCAService.diagnose_day(date)
 
 @tool
+def diagnose_spikes_and_anomalies(
+    date: str,
+    anomaly_type: Literal["all", "peak_demand", "hourly_spike", "shift_c_baseload", "power_quality", "steam"] = "all"
+) -> Dict[str, Any]:
+    """
+    Scan telemetry database to detect, isolate, and explain sudden spikes and anomalies on date (YYYY-MM-DD):
+    - Peak demand surges exceeding 1180 kVA threshold with culprit machine identification
+    - Hourly consumption spikes with category and top-device attribution
+    - Shift C (night) baseload leakage where equipment was left running
+    - Power quality excursions (Voltage THD > 5%, Current THD > 8%, Power Factor < 0.90)
+    - Steam flow spikes and pressure drops
+    Retrieves raw telemetry from opcda_readings to provide physical engineering root cause reasoning.
+    """
+    return RCAService.detect_and_explain_spikes(date, anomaly_type)
+
+@tool
+def explain_hourly_anomaly(date: str, hour: int) -> Dict[str, Any]:
+    """
+    Deep-dive telemetry retrieval for a specific hour (0 to 23 IST) on date (YYYY-MM-DD):
+    - Facility kWh and peak kVA during that exact 60-minute window
+    - Equipment category breakdown (Molding, Compressors, Airconditioning, etc.)
+    - Top 5 individual machinery meters driving consumption
+    - Power Quality (THD and Power Factor)
+    - Physical engineering verdict on why load was high or abnormal during that hour.
+    """
+    return RCAService.explain_hourly_anomaly(date, hour)
+
+@tool
 def search_ems_knowledge_base(query: str) -> Dict[str, Any]:
     """
     Search the authoritative Yamaha EMS reference document for definitions, calculation formulas,
@@ -139,6 +167,8 @@ ALL_EMS_TOOLS = [
     get_power_quality_and_utilities,
     get_breakdown_summary,
     diagnose_high_consumption,
+    diagnose_spikes_and_anomalies,
+    explain_hourly_anomaly,
     search_ems_knowledge_base,
     execute_custom_sql,
 ]

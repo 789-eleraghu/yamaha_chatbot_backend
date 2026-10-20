@@ -29,7 +29,13 @@ def test_system_prompt_integrity():
     assert "Executive Summary" in prompt
     assert "Root-Cause Attribution" in prompt
 
-    # 5. Core Invariants & Data Components
+    # 5. Spike & Anomaly Protocol
+    assert "SPIKE, ANOMALY & ROOT-CAUSE REASONING PROTOCOL" in prompt
+    assert "diagnose_spikes_and_anomalies" in prompt
+    assert "explain_hourly_anomaly" in prompt
+    assert "Peak Demand Surge (> 1180 kVA)" in prompt
+
+    # 6. Core Invariants & Data Components
     assert "Asia/Kolkata" in prompt
     assert "NEVER sum instantaneous power" in prompt
     assert "Missing data MUST return null" in prompt

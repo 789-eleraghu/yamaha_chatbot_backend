@@ -21,6 +21,8 @@ from src.tools.energy_tools import (
     get_power_quality_and_utilities,
     get_breakdown_summary,
     diagnose_high_consumption,
+    diagnose_spikes_and_anomalies,
+    explain_hourly_anomaly,
     search_ems_knowledge_base,
 )
 
@@ -92,6 +94,26 @@ def test_rca_service():
     assert "variance_kwh" in rca
     assert "top_consuming_categories" in rca
 
+    # Test spike detection on normal day
+    spikes_normal = RCAService.detect_and_explain_spikes(TEST_DATE)
+    assert spikes_normal["date"] == TEST_DATE
+    assert "findings_summary" in spikes_normal
+
+    # Test spike detection on day with excursion (2026-10-17)
+    spikes_exc = RCAService.detect_and_explain_spikes("2026-10-17")
+    assert spikes_exc["anomalies_detected_count"] > 0
+    assert any(a["domain"] == "peak_demand" for a in spikes_exc["detailed_anomalies"])
+
+    # Test hourly anomaly drill-down (Hour 15 on 2026-10-17)
+    hourly_diag = RCAService.explain_hourly_anomaly("2026-10-17", 15)
+    assert hourly_diag["hour"] == "15:00"
+    assert hourly_diag["facility_kwh"] > 0
+    assert hourly_diag["peak_apparent_power_kva"] > 1180.0
+    assert hourly_diag["threshold_exceeded"] is True
+    assert len(hourly_diag["equipment_categories"]) > 0
+    assert len(hourly_diag["top_active_devices"]) > 0
+    assert "CRITICAL" in hourly_diag["engineering_verdict"]
+
 def test_rag_retriever():
     results = ems_kb.search("tariff rescaling rule")
     assert len(results) > 0
@@ -107,6 +129,8 @@ def test_tools():
     assert get_power_quality_and_utilities.invoke({"metric": "thd", "date": TEST_DATE})["voltage_thd"]["average_percent"] > 0
     assert get_breakdown_summary.invoke({"group_by": "equipment_wise", "date": TEST_DATE})["total_kwh"] > 0
     assert diagnose_high_consumption.invoke({"date": TEST_DATE})["actual_consumption_kwh"] > 0
+    assert diagnose_spikes_and_anomalies.invoke({"date": "2026-10-17"})["anomalies_detected_count"] > 0
+    assert explain_hourly_anomaly.invoke({"date": "2026-10-17", "hour": 15})["facility_kwh"] > 0
     assert len(search_ems_knowledge_base.invoke({"query": "shift definitions"})["results"]) > 0
 
 if __name__ == "__main__":

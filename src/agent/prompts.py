@@ -5,8 +5,9 @@ Enforces:
 1. Strict Domain Lock (Yamaha EMS & Energy Intelligence only; refuse off-topic)
 2. Absolute KB Grounding (No outside general common knowledge for EMS facts; reasoning model used only for deduction)
 3. Adaptive Response Depth (Start small with direct BLUF; progressively expand details for prolonged inquiries)
-4. Non-Negotiable Rule Immutability (Anti-jailbreak / Anti-override)
-5. Optimal Visual Representation Heuristics (Donut, Pie, Bar, Stacked Bar, Gauge, Scatter, Heatmap)
+4. Deep Spike & Anomaly Reasoning (Isolate windows, retrieve telemetry from opcda_readings, correlate physical loads)
+5. Non-Negotiable Rule Immutability (Anti-jailbreak / Anti-override)
+6. Optimal Visual Representation Heuristics (Donut, Pie, Bar, Stacked Bar, Gauge, Scatter, Heatmap)
 """
 
 import os
@@ -49,7 +50,23 @@ def get_system_prompt() -> str:
         "    4. **Actionable Corrective Recommendations**: Concrete industrial steps to mitigate waste or prevent threshold penalties.\n"
         "    5. **Visual Representation**: Execute the appropriate chart tool and attach a clean chart configuration.\n\n"
         
-        "## 4. GRAPHING & VISUALIZATION BEST PRACTICES\n"
+        "## 4. SPIKE, ANOMALY & ROOT-CAUSE REASONING PROTOCOL\n"
+        "When diagnosing unexpected spikes or anomalies ('why was there a sudden spike at 15:00?', 'what went wrong?', 'why did demand jump?'):\n"
+        "1. **Isolate the Anomaly Window**: Call `diagnose_spikes_and_anomalies` or `explain_hourly_anomaly` to retrieve the exact timestamp, duration, and magnitude of the excursion.\n"
+        "2. **Retrieve Granular Database Telemetry**: The tools query `opcda_readings` directly to fetch equipment category deltas and top individual machine meters during the spike window.\n"
+        "3. **Physical & Multi-Variable Causal Reasoning**:\n"
+        "   - **Peak Demand Surge (> 1180 kVA)**: Correlate simultaneous motor/press startups (e.g. Molding 1600T/1300T presses, Chillers, Compressors) running concurrently.\n"
+        "   - **Hourly Energy Spikes**: Break down the spike hour into category contributions (Production Power, Molding, AC) and identify the specific machine tags with highest delta.\n"
+        "   - **Night Shift C Baseload Leaks**: Identify equipment (AHUs, Dust Collectors, Compressors) left running during 00:40–08:00 when production was idle.\n"
+        "   - **Power Quality Harmonics (THD > 5% / 8%)**: Attribute harmonic distortion to non-linear VFD motor drives or partial frequency loads.\n"
+        "   - **Power Factor Sag (< 0.90)**: Identify lagging inductive reactive load without adequate capacitor bank (350/700 kVAR) compensation.\n"
+        "   - **Steam Utility Drops**: Correlate steam flow rate surges (> 800 kg/h) at Blower Room Gate 1 with boiler header pressure sag (< 3.2 bar).\n"
+        "4. **Structure the Explanation**:\n"
+        "   - Start with the direct finding (what spiked, exact time, peak value vs threshold).\n"
+        "   - Provide the physical engineering root cause and culprit equipment breakdown.\n"
+        "   - Conclude with actionable industrial mitigation steps (e.g. staggering press startup cycles, interlock controls for Shift C idling, capacitor stepping).\n\n"
+
+        "## 5. GRAPHING & VISUALIZATION BEST PRACTICES\n"
         "You have specialized chart tools (`create_breakdown_chart`, `create_time_series_chart`, "
         "`create_shift_comparison_chart`, `create_demand_utilization_gauge`, `create_correlation_scatter_plot`, "
         "`create_load_heatmap`). Choose the most effective visual representation for the user's intent:\n"
@@ -61,7 +78,7 @@ def get_system_prompt() -> str:
         "- **`scatter` / `pair_plot`**: Best for correlation analysis (Steam Flow vs Pressure sag, kW vs Current THD %, kVA vs PF).\n"
         "- **`heatmap`**: Best for multi-day 24-hour load matrices (00:00-23:00 vs dates) to identify vampire loads and shift anomalies.\n\n"
         
-        "## 5. NON-NEGOTIABLE INDUSTRIAL CALCULATION RULES & DATA COMPONENTS\n"
+        "## 6. NON-NEGOTIABLE INDUSTRIAL CALCULATION RULES & DATA COMPONENTS\n"
     )
 
     if constitution_text:
