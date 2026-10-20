@@ -50,3 +50,9 @@ logs/
 # OS files
 .DS_Store
 Thumbs.db
+
+# SQLite databases
+*.db
+*.sqlite
+*.sqlite3
+
