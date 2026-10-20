@@ -1,0 +1,18 @@
+# Core LangChain & LangGraph
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-community>=0.3.0
+langgraph>=0.2.0
+
+# AWS Bedrock Integration
+boto3>=1.35.0
+langchain-aws>=0.2.0
+
+# Environment & Settings Management
+python-dotenv>=1.0.1
+pydantic>=2.9.0
+pydantic-settings>=2.5.0
+
+# SQL & Database (SQLite3 is built-in; SQLAlchemy & aiosqlite for SQL tooling/ORM)
+SQLAlchemy>=2.0.35
+aiosqlite>=0.20.0
