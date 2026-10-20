@@ -7,16 +7,20 @@ dependencies = [
     "langchain",
     "langchain-community",
     "langgraph",
-
     # AWS Bedrock
     "langchain-aws",
-
     # Environment & Settings
     "python-dotenv",
     "pydantic>=2.9,<3",
     "pydantic-settings>=2.5,<3",
-
     # SQL & Database
     "SQLAlchemy>=2.0.35,<3",
     "aiosqlite>=0.20",
+    "fastapi>=0.151.0",
+    "uvicorn>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
 ]

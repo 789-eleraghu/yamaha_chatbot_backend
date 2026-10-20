@@ -1,0 +1,69 @@
+"""
+LangGraph Orchestration Pipeline
+Orchestrates Tools, Reasoning, and Structured Response Generation
+"""
+
+from typing import Literal
+from langchain_core.messages import AIMessage, SystemMessage
+from langgraph.graph import END, StateGraph
+from langgraph.prebuilt import ToolNode
+
+from src.agent.model import get_llm
+from src.agent.prompts import SYSTEM_PROMPT
+from src.agent.state import AgentState
+from src.schemas.chat import AssistantResponse
+from src.tools.energy_tools import ALL_EMS_TOOLS
+
+def build_agent_graph():
+    # Initialize LLM with tools bound
+    base_llm = get_llm()
+    llm_with_tools = base_llm.bind_tools(ALL_EMS_TOOLS)
+    structured_llm = base_llm.with_structured_output(AssistantResponse)
+    tool_node = ToolNode(ALL_EMS_TOOLS)
+
+    def call_model(state: AgentState):
+        messages = list(state.messages)
+        # Ensure system prompt is prepended
+        if not messages or not isinstance(messages[0], SystemMessage):
+            messages = [SystemMessage(content=SYSTEM_PROMPT)] + messages
+        response = llm_with_tools.invoke(messages)
+        return {"messages": [response]}
+
+    def should_continue(state: AgentState) -> Literal["tools", "format_response"]:
+        last_message = state.messages[-1]
+        if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+            return "tools"
+        return "format_response"
+
+    def format_response(state: AgentState):
+        # Format the final turn into structured AssistantResponse (including chart config if applicable)
+        messages = list(state.messages)
+        format_prompt = SystemMessage(
+            content=(
+                "Synthesize the conversation and tool execution results into a comprehensive AssistantResponse. "
+                "Include a clean Markdown answer with bulleted findings, populate key_metrics, and if the data involves "
+                "time-series, shift comparisons, cost breakdowns, or hourly curves, generate a complete 'chart' configuration."
+            )
+        )
+        structured_output = structured_llm.invoke(messages + [format_prompt])
+        return {"structured_response": structured_output}
+
+    # Build Graph
+    workflow = StateGraph(AgentState)
+    workflow.add_node("agent", call_model)
+    workflow.add_node("tools", tool_node)
+    workflow.add_node("format_response", format_response)
+
+    workflow.set_entry_point("agent")
+    workflow.add_conditional_edges(
+        "agent",
+        should_continue,
+        {
+            "tools": "tools",
+            "format_response": "format_response"
+        }
+    )
+    workflow.add_edge("tools", "agent")
+    workflow.add_edge("format_response", END)
+
+    return workflow.compile()
