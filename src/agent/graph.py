@@ -12,14 +12,14 @@ from src.agent.model import get_llm
 from src.agent.prompts import SYSTEM_PROMPT
 from src.agent.state import AgentState
 from src.schemas.chat import AssistantResponse
-from src.tools.energy_tools import ALL_EMS_TOOLS
+from src.tools import ALL_TOOLS
 
 def build_agent_graph():
     # Initialize LLM with tools bound
     base_llm = get_llm()
-    llm_with_tools = base_llm.bind_tools(ALL_EMS_TOOLS)
+    llm_with_tools = base_llm.bind_tools(ALL_TOOLS)
     structured_llm = base_llm.with_structured_output(AssistantResponse)
-    tool_node = ToolNode(ALL_EMS_TOOLS)
+    tool_node = ToolNode(ALL_TOOLS)
 
     def call_model(state: AgentState):
         messages = list(state.messages)
