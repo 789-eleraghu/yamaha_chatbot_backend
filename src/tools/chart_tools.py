@@ -37,6 +37,7 @@ from src.services.breakdown_service import BreakdownService
 from src.services.demand_service import DemandService
 from src.services.shift_service import ShiftService
 from src.services.tariff_service import TariffService
+from src.core.normalizers import normalize_date_str
 
 # Industrial Color Palettes
 PALETTE = [
@@ -63,6 +64,7 @@ def create_breakdown_chart(
     - 'tariff_bands': Off-Peak, Normal, and Peak kWh and Cost share.
     Selects Donut with Center KPI for proportions, or Bar for ranked comparisons.
     """
+    date = normalize_date_str(date)
     if breakdown_type == "equipment_wise":
         data = BreakdownService.get_equipment_wise_breakdown(date)
         items = data.get("categories", [])
@@ -143,6 +145,7 @@ def create_time_series_chart(
     - 'voltage_thd' / 'current_thd': Harmonic distortion curve with 5% / 8% limit lines.
     - 'steam_flow': Blower Room steam flow rate trend (kg/h).
     """
+    date = normalize_date_str(date)
     if metric == "apparent_power":
         demand_data = DemandService.get_peak_demand_analysis(date)
         profile = demand_data.get("hourly_profile", [])
@@ -261,6 +264,9 @@ def create_shift_comparison_chart(
     - Single day: Donut or Grouped Bar comparing Shift A (08-17), Shift B (17-00:40), Shift C (00:40-08).
     - Multi-day: Stacked Bar showing daily total height while visualizing Shift A, B, C contributions.
     """
+    start_date = normalize_date_str(start_date)
+    if end_date:
+        end_date = normalize_date_str(end_date)
     if not end_date or end_date == start_date:
         # Single day
         shift_data = ShiftService.get_shift_consumption(start_date)
@@ -327,6 +333,7 @@ def create_demand_utilization_gauge(date: str) -> Dict[str, Any]:
     Generate an executive KPI Gauge/Radial meter showing peak apparent power (kVA)
     against the 1475.0 kVA Contracted Demand limit and 1180.0 kVA (80%) threshold.
     """
+    date = normalize_date_str(date)
     demand_data = DemandService.get_peak_demand_analysis(date)
     peak_kva = demand_data.get("peak_kva") or 0.0
     utilization_pct = demand_data.get("utilization_percent") or 0.0
@@ -363,6 +370,7 @@ def create_correlation_scatter_plot(
     - 'apparent_power_vs_pf': Transformer loading (kVA) vs Power Factor degradation.
     - 'power_vs_current_thd': Real load (kW) vs Harmonic current distortion (%).
     """
+    date = normalize_date_str(date)
     start_ts = f"{date} 00:00:00"
     end_ts = f"{date} 23:59:59"
 
@@ -461,6 +469,8 @@ def create_load_heatmap(
     Hour of Day (00:00 to 23:00) vs Calendar Dates/Days.
     Best visual representation for discovering operational load patterns, vampire loads, and shift anomalies.
     """
+    start_date = normalize_date_str(start_date)
+    end_date = normalize_date_str(end_date)
     dt_start = datetime.datetime.strptime(start_date, "%Y-%m-%d").date()
     dt_end = datetime.datetime.strptime(end_date, "%Y-%m-%d").date()
     days_count = (dt_end - dt_start).days + 1

@@ -6,6 +6,7 @@ Implements Section 1 & 2 of energy-ai-assistant-reference.md
 import datetime
 from typing import Any, Dict, List, Optional
 from src.core.constants import SHIFT_ENERGY_TAG
+from src.core.normalizers import normalize_date_str
 from src.db.sqlite_client import db_client
 
 class EnergyService:
@@ -15,6 +16,7 @@ class EnergyService:
         Calculate true daily consumption for the facility incomer for a given IST date.
         Uses tag_daily_energy_rollup if available, falls back to raw readings.
         """
+        date_str = normalize_date_str(date_str)
         # Try daily rollup
         rollup_val = db_client.get_daily_rollup_energy(SHIFT_ENERGY_TAG, date_str)
         if rollup_val is not None:

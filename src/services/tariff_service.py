@@ -5,6 +5,7 @@ Implements Section 3 of energy-ai-assistant-reference.md
 
 from typing import Any, Dict, List
 from src.core.constants import HOURLY_TARIFF_RATES, SHIFT_ENERGY_TAG
+from src.core.normalizers import normalize_date_str
 from src.db.sqlite_client import db_client
 from src.services.energy_service import EnergyService
 
@@ -19,6 +20,7 @@ class TariffService:
         4. rescaled_hour = hourly_kWh * scale
         5. cost = sum(rescaled_hour * rate)
         """
+        date_str = normalize_date_str(date_str)
         # 1. True daily kWh
         daily_info = EnergyService.get_facility_daily_energy(date_str)
         true_daily_kwh = daily_info.get("energy_kwh")

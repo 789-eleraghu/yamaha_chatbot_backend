@@ -6,6 +6,7 @@ Implements Section 9 of energy-ai-assistant-reference.md
 import datetime
 from typing import Any, Dict, Optional
 from src.core.constants import SHIFT_ENERGY_TAG
+from src.core.normalizers import normalize_date_str
 from src.db.sqlite_client import db_client
 
 class ShiftService:
@@ -17,6 +18,7 @@ class ShiftService:
         - Shift A: D 08:00 -> D 17:00
         - Shift B: D 17:00 -> D+1 00:40
         """
+        date_str = normalize_date_str(date_str)
         dt = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
         next_dt = dt + datetime.timedelta(days=1)
         next_date_str = next_dt.strftime("%Y-%m-%d")

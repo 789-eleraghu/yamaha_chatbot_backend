@@ -48,7 +48,10 @@ def get_system_prompt() -> str:
         "    2. **Root-Cause Attribution & Breakdown**: Quantitative decomposition (which equipment category, cost center, or shift drove the variance; baseload leakage during Shift C night hours).\n"
         "    3. **Engineering Calculations & Telemetry Evidence**: Exact counter deltas, TOD tariff band splits, power factor or THD harmonic compliance, peak kVA excursions.\n"
         "    4. **Actionable Corrective Recommendations**: Concrete industrial steps to mitigate waste or prevent threshold penalties.\n"
-        "    5. **Visual Representation**: Execute the appropriate chart tool and attach a clean chart configuration.\n\n"
+        "    5. **Visual Representation**: Execute the appropriate chart tool and attach a clean chart configuration.\n"
+        "- **Robust Typo & Colloquial Phrasing Tolerance**:\n"
+        "  * Seamlessly tolerate user typographical errors, phonetic misspellings, informal grammar, and alternate spellings in prompts (e.g. 'moulding' for 'Molding', 'yestarday' for 'yesterday', 'compreser' for 'Compressor', 'shft c' for 'Shift C', 'peak demnd' for 'Peak Demand', 'admin' for 'General Admin', 'wh' for 'Material W/H').\n"
+        "  * Silently resolve and normalize all user inputs to canonical Yamaha EMS nomenclature and standard date formats (YYYY-MM-DD) before tool execution. Never reject a valid intent due to minor spelling or grammatical errors.\n\n"
         
         "## 4. SPIKE, ANOMALY & ROOT-CAUSE REASONING PROTOCOL\n"
         "When diagnosing unexpected spikes or anomalies ('why was there a sudden spike at 15:00?', 'what went wrong?', 'why did demand jump?'):\n"

@@ -22,6 +22,7 @@ from src.core.constants import (
     STEAM_PRESSURE_TAG,
     VOLTAGE_THD_TAGS,
 )
+from src.core.normalizers import normalize_date_str
 from src.db.sqlite_client import db_client
 from src.services.breakdown_service import BreakdownService
 from src.services.demand_service import DemandService
@@ -40,6 +41,7 @@ class RCAService:
         3. Check for night shift (Shift C) baseload inflation
         4. Cross-reference peak demand excursions
         """
+        date_str = normalize_date_str(date_str)
         target_energy = EnergyService.get_facility_daily_energy(date_str)
         day_kwh = target_energy.get("energy_kwh") or 0.0
 
@@ -106,6 +108,7 @@ class RCAService:
         4. Power Quality Harmonic and Power Factor Excursions.
         5. Steam utility spikes and pressure drops.
         """
+        date_str = normalize_date_str(date_str)
         anomalies_found: List[Dict[str, Any]] = []
         findings_summary: List[str] = []
 
@@ -340,6 +343,7 @@ class RCAService:
         if not (0 <= hour <= 23):
             return {"error": f"Invalid hour: {hour}. Must be between 0 and 23."}
 
+        date_str = normalize_date_str(date_str)
         start_ts = f"{date_str} {hour:02d}:00:00"
         end_ts = f"{date_str} {hour:02d}:59:59"
 

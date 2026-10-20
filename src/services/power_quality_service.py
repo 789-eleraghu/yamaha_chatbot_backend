@@ -14,6 +14,7 @@ from src.core.constants import (
     VOLTAGE_THD_LIMIT_PERCENT,
     VOLTAGE_THD_TAGS,
 )
+from src.core.normalizers import normalize_date_str
 from src.db.sqlite_client import db_client
 
 class PowerQualityService:
@@ -23,6 +24,7 @@ class PowerQualityService:
         Analyze Voltage and Current Harmonics (THD) for South Utilities Transformer.
         Limits: Voltage THD = 5%, Current THD = 8%
         """
+        date_str = normalize_date_str(date_str)
         start_ts = f"{date_str} 00:00:00"
         end_ts = f"{date_str} 23:59:59"
 
@@ -72,6 +74,7 @@ class PowerQualityService:
     @staticmethod
     def get_reactive_energy(date_str: str) -> Dict[str, Any]:
         """Calculate cumulative kVARh for the 2 trustworthy transformers."""
+        date_str = normalize_date_str(date_str)
         start_ts = f"{date_str} 00:00:00"
         end_ts = f"{date_str} 23:59:59"
 
@@ -89,6 +92,7 @@ class PowerQualityService:
     @staticmethod
     def get_steam_summary(date_str: str) -> Dict[str, Any]:
         """Get Steam flow rate snapshot, pressure, and steam consumed for date."""
+        date_str = normalize_date_str(date_str)
         # Latest snapshot
         q_snap = """
             SELECT tag_id, value, reading_timestamp

@@ -5,6 +5,7 @@ Implements Section 10, 11, 12 & 13 of energy-ai-assistant-reference.md
 
 from typing import Any, Dict, List
 from src.core.constants import CATEGORY_EXCLUDED_TAGS, EQUIPMENT_WISE_CATEGORIES
+from src.core.normalizers import normalize_date_str
 from src.db.sqlite_client import db_client
 from src.db.tag_catalog import COST_CENTER_MAPPINGS
 
@@ -15,6 +16,7 @@ class BreakdownService:
         Compute energy for the 8 standard equipment categories (Section 12),
         applying the mandatory exclusions (G0_144_Dust_Collector & PA_FA_Inspection_Box-AC).
         """
+        date_str = normalize_date_str(date_str)
         category_results = []
         total_kwh = 0.0
 
@@ -56,6 +58,7 @@ class BreakdownService:
         Compute energy for the 17 organizational cost centers (Section 13)
         using exact mapped tag lists.
         """
+        date_str = normalize_date_str(date_str)
         cost_centers = []
         total_kwh = 0.0
 

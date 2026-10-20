@@ -8,6 +8,8 @@ import re
 from typing import Dict, List, Optional
 from src.core.config import settings
 
+from src.core.normalizers import is_fuzzy_match
+
 class EMSKnowledgeBase:
     def __init__(self, doc_paths: Optional[List[str]] = None):
         if doc_paths is None:
@@ -61,13 +63,19 @@ class EMSKnowledgeBase:
             })
 
     def search(self, query: str, top_k: int = 3) -> List[Dict[str, str]]:
-        """Keyword-ranked search across reference sections."""
+        """Keyword-ranked and typo-tolerant search across reference sections."""
         query_words = set(query.lower().split())
         scored_sections = []
 
         for sec in self.sections:
             text = f"{sec['header']} {sec['content']}".lower()
-            matches = sum(1 for w in query_words if w in text)
+            matches = sum(2 for w in query_words if w in text)
+            # Typo-tolerant fuzzy fallback if exact word not found
+            if matches == 0:
+                header_words = sec['header'].lower().split()
+                if any(any(is_fuzzy_match(qw, hw, cutoff=0.75) for hw in header_words) for qw in query_words):
+                    matches += 1
+
             if matches > 0:
                 scored_sections.append((matches, sec))
 

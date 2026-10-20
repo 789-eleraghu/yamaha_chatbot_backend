@@ -9,6 +9,7 @@ from src.core.constants import (
     PEAK_DEMAND_TAG,
     PEAK_DEMAND_THRESHOLD_KVA,
 )
+from src.core.normalizers import normalize_date_str
 from src.db.sqlite_client import db_client
 
 class DemandService:
@@ -20,6 +21,7 @@ class DemandService:
         - Hourly peak profiles
         - Contiguous excursions above 1180 kVA threshold
         """
+        date_str = normalize_date_str(date_str)
         start_ts = f"{date_str} 00:00:00"
         end_ts = f"{date_str} 23:59:59"
 

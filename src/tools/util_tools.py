@@ -250,30 +250,60 @@ def read_project_file(file_path: str, start_line: int = 1, num_lines: int = 100)
 # Tag Catalog Search Tool
 # ---------------------------------------------------------
 
+from src.core.normalizers import (
+    normalize_category_name,
+    normalize_cost_center_name,
+    is_fuzzy_match
+)
+
 @tool
 def search_tag_catalog(keyword: str) -> Dict[str, Any]:
     """
     Search the authoritative Yamaha tag catalog by meter name, machine, or keyword
     (e.g. 'chiller', 'molding', 'transformer', 'dust_collector', 'steam', 'solar').
+    Tolerates typographical errors, misspellings ('chiler', 'mouldng', 'compreser'),
+    and colloquial aliases ('ac', 'lights', 'admin').
     Returns exact tag IDs and their associated Cost Center or Equipment Category.
     """
     kw = keyword.lower().strip()
     results = []
+    seen_tags = set()
+
+    # Normalize aliases if applicable (e.g. 'moulding' -> 'Molding', 'ac' -> 'Airconditioning')
+    resolved_cat = normalize_category_name(kw)
+    resolved_cc = normalize_cost_center_name(kw)
 
     # 1. Search in Cost Centers
     for cc_name, tags in COST_CENTER_MAPPINGS.items():
+        is_cc_target = (
+            kw in cc_name.lower() or 
+            (resolved_cc and resolved_cc.lower() == cc_name.lower()) or
+            is_fuzzy_match(kw, cc_name, cutoff=0.7)
+        )
         for t in tags:
-            if kw in t.lower() or kw in cc_name.lower():
-                results.append({
-                    "tag_id": t,
-                    "mapping_type": "Cost Center",
-                    "group_name": cc_name
-                })
+            t_lower = t.lower()
+            tokens = [tok for tok in t_lower.replace('/', '_').replace('.', '_').split('_') if tok]
+            has_token_match = any(is_fuzzy_match(kw, tok, cutoff=0.75) for tok in tokens)
+            
+            if is_cc_target or kw in t_lower or has_token_match:
+                if t not in seen_tags:
+                    seen_tags.add(t)
+                    results.append({
+                        "tag_id": t,
+                        "mapping_type": "Cost Center",
+                        "group_name": cc_name
+                    })
 
     # 2. Search in Category Configs
     for cat_name, cfg in CATEGORY_CONFIG.items():
         prefix = cfg["prefix"]
-        if kw in cat_name.lower() or kw in prefix.lower():
+        is_cat_target = (
+            kw in cat_name.lower() or
+            kw in prefix.lower() or
+            (resolved_cat and resolved_cat.lower() == cat_name.lower()) or
+            is_fuzzy_match(kw, cat_name, cutoff=0.7)
+        )
+        if is_cat_target:
             results.append({
                 "tag_prefix": prefix,
                 "suffix": cfg["suffix"],
@@ -283,6 +313,7 @@ def search_tag_catalog(keyword: str) -> Dict[str, Any]:
 
     return {
         "keyword": keyword,
+        "resolved_alias": resolved_cat or resolved_cc or None,
         "match_count": len(results),
         "matches": results[:40]
     }
