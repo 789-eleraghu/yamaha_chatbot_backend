@@ -36,13 +36,15 @@ def build_agent_graph():
         return "format_response"
 
     def format_response(state: AgentState):
-        # Format the final turn into structured AssistantResponse (including chart config if applicable)
+        # Format the final turn into structured AssistantResponse adhering to Adaptive Depth Protocol
         messages = list(state.messages)
         format_prompt = SystemMessage(
             content=(
-                "Synthesize the conversation and tool execution results into a comprehensive AssistantResponse. "
-                "Include a clean Markdown answer with bulleted findings, populate key_metrics, and if the data involves "
-                "time-series, shift comparisons, cost breakdowns, or hourly curves, generate a complete 'chart' configuration."
+                "Synthesize the conversation and tool execution results into an AssistantResponse following the Adaptive Depth Protocol:\n"
+                "1. Answer direct consumer queries with the bottom-line metric first (start small, concise, and apt).\n"
+                "2. If the user requested prolonged points, root-cause investigations, comparisons, or audits, provide structured technical sections (Executive Summary, Root-Cause Attribution, Calculations/Evidence, Recommendations).\n"
+                "3. Populate 'key_metrics' with all core numerical results, attach data quality notes if nulls/exclusions exist, and if the user requested or benefits from visual analysis, attach the optimal 'chart' configuration.\n"
+                "4. Maintain strict domain grounding: no external facts or outside common knowledge; only findings derived from tools and the Yamaha EMS knowledge base."
             )
         )
         structured_output = structured_llm.invoke(messages + [format_prompt])
