@@ -5,27 +5,31 @@ Parses and searches energy-ai-assistant-reference.md
 
 import os
 import re
-from typing import Dict, List
+from typing import Dict, List, Optional
 from src.core.config import settings
 
 class EMSKnowledgeBase:
-    def __init__(self, doc_path: str = settings.REFERENCE_DOC_PATH):
-        self.doc_path = doc_path
+    def __init__(self, doc_paths: Optional[List[str]] = None):
+        if doc_paths is None:
+            self.doc_paths = [settings.REFERENCE_DOC_PATH, "EMS_DATA_COMPONENTS_AND_RULES.md"]
+        else:
+            self.doc_paths = doc_paths
         self.sections: List[Dict[str, str]] = []
-        self._load_document()
+        for path in self.doc_paths:
+            self._load_document(path)
 
-    def _load_document(self):
-        if not os.path.exists(self.doc_path):
+    def _load_document(self, path: str):
+        if not os.path.exists(path):
             return
 
-        with open(self.doc_path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             content = f.read()
 
         # Split by top-level headers (# 1., # 2., etc.)
         pattern = r"(^#+ .+$)"
         splits = re.split(pattern, content, flags=re.MULTILINE)
 
-        current_header = "Introduction"
+        current_header = f"Introduction ({os.path.basename(path)})"
         current_body = []
 
         for part in splits:
@@ -36,17 +40,19 @@ class EMSKnowledgeBase:
                 if current_body:
                     self.sections.append({
                         "header": current_header,
-                        "content": "\n".join(current_body)
+                        "content": "\n".join(current_body),
+                        "source": path
                     })
                     current_body = []
-                current_header = part.lstrip("#").strip()
+                current_header = f"{part.lstrip('#').strip()} ({os.path.basename(path)})"
             else:
                 current_body.append(part)
 
         if current_body:
             self.sections.append({
                 "header": current_header,
-                "content": "\n".join(current_body)
+                "content": "\n".join(current_body),
+                "source": path
             })
 
     def search(self, query: str, top_k: int = 3) -> List[Dict[str, str]]:
