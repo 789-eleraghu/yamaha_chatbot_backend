@@ -3,7 +3,7 @@ Chat & Assistant Schemas
 """
 
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from src.schemas.charts import ChartConfig
 
 class ChatRequest(BaseModel):
@@ -26,6 +26,16 @@ class AssistantResponse(BaseModel):
         default=None,
         description="Explanations of any data gaps, exclusions, sensor anomalies, or missing data (null)"
     )
+
+    @field_validator("chart", mode="before")
+    @classmethod
+    def clean_chart(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if isinstance(v, dict):
+            if not v or not v.get("chart_type"):
+                return None
+        return v
 
 class ChatResponse(BaseModel):
     session_id: str

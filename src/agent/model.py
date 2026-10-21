@@ -13,6 +13,31 @@ def get_llm() -> BaseChatModel:
 
     if provider == "bedrock":
         from langchain_aws import ChatBedrockConverse
+
+        if settings.AWS_BEARER_TOKEN:
+            import boto3
+            boto3_client = boto3.client(
+                "bedrock-runtime",
+                region_name=settings.AWS_REGION,
+                aws_access_key_id="",
+                aws_secret_access_key="",
+            )
+
+            token = settings.AWS_BEARER_TOKEN
+            def add_bearer_header(request, **kwargs):
+                request.headers["Authorization"] = f"Bearer {token}"
+
+            boto3_client.meta.events.register("before-send.bedrock-runtime.Converse", add_bearer_header)
+            boto3_client.meta.events.register("before-send.bedrock-runtime.ConverseStream", add_bearer_header)
+
+            return ChatBedrockConverse(
+                client=boto3_client,
+                model=settings.BEDROCK_MODEL_ID,
+                region_name=settings.AWS_REGION,
+                temperature=settings.TEMPERATURE,
+                max_tokens=settings.MAX_TOKENS,
+            )
+
         return ChatBedrockConverse(
             model=settings.BEDROCK_MODEL_ID,
             region_name=settings.AWS_REGION,

@@ -88,6 +88,7 @@ def create_breakdown_chart(
         total_kwh = tariff_data.get("true_daily_kwh", 0.0)
         labels = list(bands.keys())
         values = [b["kwh"] for b in bands.values()]
+        items = [{"band": k, "kwh": v["kwh"]} for k, v in bands.items()]
         unit = "kWh"
     else:
         return {"error": f"Unknown breakdown_type: {breakdown_type}"}
@@ -130,7 +131,71 @@ def create_breakdown_chart(
         center_kpi=center_kpi if selected_type in ("donut", "pie") else None,
         representation_reason=reason
     )
-    return config.model_dump()
+    result = config.model_dump()
+    result["total_kwh"] = total_kwh
+    result["categories"] = items
+    result["breakdown"] = items
+    result["chart_config"] = config.model_dump()
+    return result
+
+@tool
+def aggregate_energy_telemetry(
+    aggregation_type: Literal[
+        "equipment_wise",
+        "zone_wise",
+        "facility",
+        "specific_equipment",
+        "multi_variate",
+        "radar_comparison"
+    ] = "equipment_wise",
+    start_date: str = "yesterday",
+    end_date: Optional[str] = None,
+    granularity: Literal["daily", "hourly", "30min", "15min", "shift_wise"] = "daily",
+    equipment: Optional[List[str]] = None,
+    zones: Optional[List[str]] = None,
+    metrics: Optional[List[str]] = None,
+    chart_type: Literal[
+        "auto",
+        "bar",
+        "grouped_bar",
+        "stacked_bar",
+        "horizontal_bar",
+        "line",
+        "area",
+        "stacked_area",
+        "donut",
+        "pie",
+        "radar",
+        "radial_bar",
+        "composed",
+        "scatter",
+        "heatmap",
+        "treemap"
+    ] = "auto"
+) -> Dict[str, Any]:
+    """
+    Unified industrial telemetry and energy aggregation tool for Yamaha EMS.
+    Performs multi-dimensional analysis in a SINGLE call without needing multiple tool executions:
+    - 'equipment_wise': Aggregates 8 machinery categories with exclusions applied.
+    - 'zone_wise': Aggregates 17 organizational cost centers (e.g. AG Assy, AG Painting, General Admin).
+    - 'facility': Total facility grid energy trend or hourly/30-min load curve.
+    - 'specific_equipment': Pass single or array of machines (e.g. ['Compressor 1', 'Molding 1600T', 'Chiller']).
+    - 'multi_variate': Correlates Energy (kWh) with Peak Demand (kVA) and Power Factor on dual Y-axes ComposedChart.
+    - 'radar_comparison': Multi-attribute Radar/Spider diagram comparing operational shifts across 5 dimensions.
+    - 'granularity': 'daily', 'hourly', '30min' (every 30 minutes, 48 intervals), '15min' (every 15 minutes, 96 intervals).
+    Returns both the numerical telemetry dataset and the complete interactive Recharts ChartConfig.
+    """
+    from src.services.aggregation_service import aggregation_service
+    return aggregation_service.aggregate(
+        aggregation_type=aggregation_type,
+        start_date=start_date,
+        end_date=end_date,
+        granularity=granularity,
+        equipment=equipment,
+        zones=zones,
+        metrics=metrics,
+        chart_type=chart_type
+    )
 
 @tool
 def create_time_series_chart(
@@ -508,6 +573,7 @@ def create_load_heatmap(
     return config.model_dump()
 
 ALL_CHART_TOOLS = [
+    aggregate_energy_telemetry,
     create_breakdown_chart,
     create_time_series_chart,
     create_shift_comparison_chart,

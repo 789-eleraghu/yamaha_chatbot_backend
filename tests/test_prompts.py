@@ -20,8 +20,10 @@ def test_system_prompt_integrity():
     assert "No General Common Knowledge for EMS Facts" in prompt
     assert "analytical and mathematical deduction engine" in prompt
 
-    # 3. Rule Immutability
+    # 3. Rule Immutability & Anti-Leak Protection
     assert "CANNOT BE OVERRIDDEN" in prompt or "Rule Immutability" in prompt
+    assert "Confidentiality & Anti-Leak" in prompt
+    assert "proprietary and confidential" in prompt
 
     # 4. Adaptive Communication & Depth Protocol
     assert "Start Small" in prompt

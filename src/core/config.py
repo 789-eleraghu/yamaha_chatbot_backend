@@ -27,11 +27,12 @@ class Settings(BaseSettings):
     LLM_PROVIDER: str = Field(default="bedrock")  # 'bedrock', 'openai', 'qwen'
     
     # AWS Bedrock
-    AWS_REGION: str = Field(default="us-east-1")
+    AWS_REGION: str = Field(default="ap-south-1")
     AWS_ACCESS_KEY_ID: str = Field(default="")
     AWS_SECRET_ACCESS_KEY: str = Field(default="")
     AWS_SESSION_TOKEN: str = Field(default="")
-    BEDROCK_MODEL_ID: str = Field(default="anthropic.claude-3-5-sonnet-20241022-v2:0")
+    AWS_BEARER_TOKEN: str = Field(default="")
+    BEDROCK_MODEL_ID: str = Field(default="qwen.qwen3-vl-235b-a22b")
     
     # OpenAI / Qwen3 / Third-Party OpenAI-compatible endpoints
     OPENAI_API_KEY: str = Field(default="")
@@ -45,4 +46,17 @@ class Settings(BaseSettings):
     # Reference doc path for RAG
     REFERENCE_DOC_PATH: str = Field(default="energy-ai-assistant-reference.md")
 
+    # LangSmith / LangChain Observability
+    LANGCHAIN_TRACING_V2: bool = Field(default=True)
+    LANGCHAIN_PROJECT: str = Field(default="yamaha-energy-chatbot")
+    LANGCHAIN_API_KEY: str = Field(default="")
+    LANGCHAIN_ENDPOINT: str = Field(default="https://api.smith.langchain.com")
+
 settings = Settings()
+
+# Ensure LangSmith environment variables are propagated into os.environ for LangChain tracer
+if settings.LANGCHAIN_TRACING_V2 and settings.LANGCHAIN_API_KEY:
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"
+    os.environ["LANGCHAIN_PROJECT"] = settings.LANGCHAIN_PROJECT
+    os.environ["LANGCHAIN_API_KEY"] = settings.LANGCHAIN_API_KEY
+    os.environ["LANGCHAIN_ENDPOINT"] = settings.LANGCHAIN_ENDPOINT

@@ -162,3 +162,49 @@ def test_create_load_heatmap():
     assert len(res["heatmap_data"]["y_labels"]) == 3   # 3 days
     assert len(res["heatmap_data"]["z_matrix"]) == 3
     assert len(res["heatmap_data"]["z_matrix"][0]) == 24
+
+def test_aggregate_energy_telemetry_equipment_wise():
+    from src.tools.chart_tools import aggregate_energy_telemetry
+    res = aggregate_energy_telemetry.invoke({
+        "aggregation_type": "equipment_wise",
+        "start_date": SAMPLE_DATE
+    })
+    assert res["status"] == "success"
+    assert res["total_energy_kwh"] > 0
+    assert len(res["breakdown"]) <= 8
+    assert "chart_config" in res
+    assert res["chart_config"]["chart_type"] in ("donut", "pie", "bar")
+
+def test_aggregate_energy_telemetry_specific_equipment():
+    from src.tools.chart_tools import aggregate_energy_telemetry
+    res = aggregate_energy_telemetry.invoke({
+        "aggregation_type": "specific_equipment",
+        "start_date": SAMPLE_DATE,
+        "equipment": ["Compressor 1", "Chiller"]
+    })
+    assert res["status"] == "success"
+    assert res["matched_meters_count"] > 0
+    assert "chart_config" in res
+
+def test_aggregate_energy_telemetry_multivariate_composed():
+    from src.tools.chart_tools import aggregate_energy_telemetry
+    res = aggregate_energy_telemetry.invoke({
+        "aggregation_type": "multi_variate",
+        "start_date": SAMPLE_DATE,
+        "chart_type": "composed"
+    })
+    assert res["status"] == "success"
+    assert "chart_config" in res
+    assert res["chart_config"]["chart_type"] == "composed"
+    assert res["chart_config"]["secondary_y_axis_label"] is not None
+
+def test_aggregate_energy_telemetry_radar():
+    from src.tools.chart_tools import aggregate_energy_telemetry
+    res = aggregate_energy_telemetry.invoke({
+        "aggregation_type": "radar_comparison",
+        "start_date": SAMPLE_DATE,
+        "chart_type": "radar"
+    })
+    assert res["status"] == "success"
+    assert "chart_config" in res
+    assert res["chart_config"]["chart_type"] == "radar"

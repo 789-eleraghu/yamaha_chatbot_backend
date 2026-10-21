@@ -10,52 +10,21 @@ import re
 from typing import Dict, List, Optional
 from src.core.constants import EQUIPMENT_WISE_CATEGORIES
 from src.db.tag_catalog import COST_CENTER_MAPPINGS
+from src.services.date_service import date_service
 
 # ---------------------------------------------------------
 # 1. Date Normalization (Whitespace, Slashes, Ordinals, Words)
 # ---------------------------------------------------------
 
-DATE_FORMATS = [
-    "%Y-%m-%d",
-    "%Y/%m/%d",
-    "%d-%m-%Y",
-    "%d/%m/%Y",
-    "%Y.%m.%d",
-    "%d %b %Y",
-    "%d %B %Y",
-    "%B %d %Y",
-    "%b %d %Y",
-    "%d-%b-%Y",
-    "%d-%B-%Y",
-]
-
 def normalize_date_str(date_str: str) -> str:
     """
-    Tolerantly parse and normalize a date string into standard 'YYYY-MM-DD'.
-    Handles whitespace, slashes ('2026/10/15'), reverse order ('15-10-2026'),
-    ordinals ('15th October 2026'), and abbreviated month names ('15 Oct 2026').
+    Tolerantly parse and normalize a date string into standard 'YYYY-MM-DD'
+    using the centralized DateService.
     """
     if not date_str:
         return ""
-    
-    s = str(date_str).strip()
-    # Remove ordinal suffixes: 1st, 2nd, 3rd, 14th, 15th
-    s_clean = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", s, flags=re.IGNORECASE)
-
-    for fmt in DATE_FORMATS:
-        try:
-            dt = datetime.datetime.strptime(s_clean, fmt)
-            return dt.strftime("%Y-%m-%d")
-        except ValueError:
-            pass
-            
-    # Fallback to regex pattern YYYY-MM-DD if embedded in surrounding noise
-    match = re.search(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", s)
-    if match:
-        y, m, d = match.groups()
-        return f"{int(y):04d}-{int(m):02d}-{int(d):02d}"
-
-    return s
+    norm = date_service.normalize_and_validate_date(date_str)
+    return norm if norm is not None else str(date_str).strip()
 
 # ---------------------------------------------------------
 # 2. Equipment Category Aliases & Fuzzy Matching

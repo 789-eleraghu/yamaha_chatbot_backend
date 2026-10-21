@@ -3,7 +3,7 @@ LangChain Tools for Yamaha EMS Assistant
 Wraps deterministic services with descriptive schemas for LLM tool calling.
 """
 
-from typing import Any, Dict, Literal
+from typing import Any, Dict, List, Literal, Optional
 from langchain_core.tools import tool
 from src.services.breakdown_service import BreakdownService
 from src.services.demand_service import DemandService
@@ -19,18 +19,16 @@ from src.db.sqlite_client import db_client
 @tool
 def get_energy_consumption(date: str) -> Dict[str, Any]:
     """
-    Get the total facility electricity consumption (kWh) for a specific IST date (YYYY-MM-DD).
-    Uses the authoritative Main Incomer counter delta.
+    Get total facility grid electricity consumption (kWh) on the HT_Room 11kV Main Incomer for a specific IST date (YYYY-MM-DD), e.g. 'yesterday's facility consumption', 'total energy today', or daily grid power.
+    Uses authoritative counter delta max - min.
     """
     return EnergyService.get_facility_daily_energy(date)
 
 @tool
 def get_shift_wise_consumption(date: str) -> Dict[str, Any]:
     """
-    Get shift-wise consumption (kWh) for a calendar day (YYYY-MM-DD) on HT_Room Main Incomer:
-    - Shift A: 08:00 - 17:00
-    - Shift B: 17:00 - 00:40 (next day)
-    - Shift C: 00:40 - 08:00
+    Retrieve shift-wise electricity consumption (kWh) for Shift A, B, and C on the HT_Room Main Incomer for a given date (YYYY-MM-DD), including 'yesterday's shift consumption', 'today's shifts', or any specific date.
+    Shifts: Shift A (08:00–17:00), Shift B (17:00–00:40 next day), Shift C (00:40–08:00).
     Boundary values use nearest readings at or before exact boundary.
     """
     return ShiftService.get_shift_consumption(date)
@@ -38,7 +36,7 @@ def get_shift_wise_consumption(date: str) -> Dict[str, Any]:
 @tool
 def get_cost_and_tariff(date: str) -> Dict[str, Any]:
     """
-    Calculate daily electricity cost (in INR) under Tariff HT_1 using the exact rescaling rule:
+    Calculate daily electricity billing and cost (in INR / ₹) under Tariff HT_1 TOD (Time of Day) schedule for date (YYYY-MM-DD), e.g. 'yesterday's bill', 'electricity cost for 2026-10-19', 'TOD tariff charges'.
     scale = true_daily_kWh / sum(hourly_kWh), then rescaled_hour * tariff_rate.
     Returns total cost, tariff band summary (Off-Peak, Normal, Peak), and hourly breakdown.
     """
@@ -47,10 +45,10 @@ def get_cost_and_tariff(date: str) -> Dict[str, Any]:
 @tool
 def get_peak_demand_analysis(date: str) -> Dict[str, Any]:
     """
-    Analyze peak apparent power (kVA) on the South Utilities Transformer for date (YYYY-MM-DD):
-    - Peak kVA and utilization % against 1475 kVA contracted capacity
+    Analyze peak apparent power demand (kVA) on the South Utilities Transformer for date (YYYY-MM-DD), e.g. 'peak demand yesterday', 'kVA utilization', 'demand excursions'.
+    - Peak kVA and utilization % against 1475.0 kVA contracted capacity
     - Hourly peak profile (00:00 to 23:00)
-    - Excursion events exceeding the 80% threshold (1180 kVA)
+    - Excursion events exceeding the 80% threshold (1180.0 kVA)
     """
     return DemandService.get_peak_demand_analysis(date)
 
@@ -158,6 +156,22 @@ def execute_custom_sql(query: str) -> Dict[str, Any]:
     except Exception as e:
         return {"error": str(e)}
 
+@tool
+def get_realtime_device_telemetry(device_name: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Get live real-time diagnostic telemetry snapshots for representative devices (Component 10).
+    Returns voltage, current, power factor, real power (kW), apparent power (kVA), frequency (Hz), and status.
+    Representative devices: HT_Room, North_Utilities, Molding, Compressor, Airconditioning, Lighting, Solar, DG, Dust_Collector, Paintshop.
+    """
+    from src.db.chat_history import chat_repo
+    readings = chat_repo.get_live_device_telemetry(device_name)
+    return {
+        "status": "success",
+        "device_filter": device_name,
+        "count": len(readings),
+        "telemetry": readings
+    }
+
 ALL_EMS_TOOLS = [
     get_energy_consumption,
     get_shift_wise_consumption,
@@ -170,5 +184,6 @@ ALL_EMS_TOOLS = [
     diagnose_spikes_and_anomalies,
     explain_hourly_anomaly,
     search_ems_knowledge_base,
+    get_realtime_device_telemetry,
     execute_custom_sql,
 ]

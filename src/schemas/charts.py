@@ -17,10 +17,15 @@ ChartType = Literal[
     "bar",
     "stacked_bar",
     "grouped_bar",
+    "horizontal_bar",
     "area",
     "stacked_area",
     "donut",
     "pie",
+    "radar",
+    "radial_bar",
+    "composed",
+    "treemap",
     "scatter",
     "pair_plot",
     "gauge",
@@ -32,6 +37,18 @@ class ChartSeries(BaseModel):
     data: List[Union[float, int, None]] = Field(description="Array of numeric data values")
     color: Optional[str] = Field(default=None, description="Optional hex color string (e.g. '#2563EB')")
     unit: Optional[str] = Field(default=None, description="Unit of measurement (e.g. 'kWh', 'kVA', '%', '₹')")
+    series_type: Optional[Literal["bar", "line", "area", "scatter"]] = Field(
+        default=None,
+        description="For composed charts: individual series representation type"
+    )
+    y_axis_id: Optional[Literal["left", "right"]] = Field(
+        default="left",
+        description="For multi-variate composed charts: which vertical axis ('left' or 'right') to bind to"
+    )
+    stroke_dasharray: Optional[str] = Field(
+        default=None,
+        description="Optional dash array (e.g. '4 4') for reference or target series"
+    )
 
 class ScatterPoint(BaseModel):
     x: float = Field(description="X-coordinate value")
@@ -68,6 +85,8 @@ class ChartConfig(BaseModel):
     x_axis_label: Optional[str] = Field(default=None, description="Label for X-axis (e.g. 'Hour of Day', 'Shift', 'Category')")
     x_labels: Optional[List[str]] = Field(default=None, description="Labels for X-axis categories/timestamps")
     y_axis_label: Optional[str] = Field(default=None, description="Label for primary Y-axis (e.g. 'kWh', 'kVA', '₹')")
+    secondary_y_axis_label: Optional[str] = Field(default=None, description="Label for secondary Y-axis on composed multi-variate charts (e.g. 'Power Factor', 'kVA')")
+    layout: Optional[Literal["horizontal", "vertical"]] = Field(default="horizontal", description="Orientation for bar charts ('horizontal' for side-by-side or 'vertical' for horizontal ranking bars)")
     series: Optional[List[ChartSeries]] = Field(default=None, description="Standard line/bar/area data series")
     
     # Reference and limit lines
@@ -81,6 +100,9 @@ class ChartConfig(BaseModel):
     scatter_series: Optional[List[ScatterSeries]] = Field(default=None, description="Payload for scatter and pair plots")
     gauge_data: Optional[GaugeConfig] = Field(default=None, description="Payload for gauge / radial charts")
     heatmap_data: Optional[HeatmapMatrix] = Field(default=None, description="Payload for 2D hourly/weekly heatmaps")
+    treemap_data: Optional[List[Dict[str, Any]]] = Field(default=None, description="Payload for hierarchical Treemap visual allocation")
+    radar_data: Optional[List[Dict[str, Any]]] = Field(default=None, description="Payload for multi-axial Radar / Spider comparisons")
+    radial_bar_data: Optional[List[Dict[str, Any]]] = Field(default=None, description="Payload for concentric RadialBar gauge displays")
     
     # Donut center KPI metric
     center_kpi: Optional[Dict[str, Any]] = Field(
