@@ -4,14 +4,17 @@ Supports multi-category, multi-equipment, multi-date range, multi-granularity,
 and multi-variate industrial telemetry aggregation for Yamaha Plant EMS.
 Generates comprehensive numerical summaries and complete Recharts ChartConfig payloads
 in a single unified execution.
+
+This version uses native ClickHouse queries for production database.
 """
 
 import datetime
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 from src.core.constants import (
     CONTRACTED_DEMAND_KVA,
     PEAK_DEMAND_THRESHOLD_KVA,
     SHIFT_ENERGY_TAG,
+    SOLAR_ENERGY_TAG,
     PEAK_DEMAND_TAG,
     EQUIPMENT_WISE_CATEGORIES,
     CATEGORY_EXCLUDED_TAGS,
@@ -19,7 +22,7 @@ from src.core.constants import (
     HOURLY_TARIFF_RATES
 )
 from src.core.normalizers import normalize_date_str
-from src.db.sqlite_client import db_client
+from src.db.client import db_client
 from src.db.tag_catalog import COST_CENTER_MAPPINGS
 from src.schemas.charts import (
     ChartConfig,
@@ -44,25 +47,49 @@ DEFAULT_PALETTE = [
     "#F59E0B",  # Orange
     "#6366F1",  # Indigo
     "#EC4899",  # Rose
+    "#14B8A6",  # Teal-400
+    "#8B5CF6",  # Violet
+    "#F43F5E",  # Rose-500
+    "#84CC16",  # Lime
+    "#06B6D4",  # Cyan-500
+    "#A855F7",  # Purple-500
+    "#EAB308",  # Yellow
+    "#22C55E",  # Green-500
 ]
+
 
 class AggregationService:
     """Enterprise aggregation engine for multi-dimensional EMS telemetry."""
 
     @staticmethod
     def _get_time_buckets(granularity: str) -> Tuple[List[str], str]:
+        """
+        Return (list of time bucket labels, ClickHouse SQL expression for bucketing).
+        Uses native ClickHouse formatDateTime and concat functions.
+        """
         g = (granularity or "hourly").lower()
         if "30" in g or "half" in g:
             buckets = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)]
-            sql_expr = "(strftime('%H', reading_timestamp) || ':' || CASE WHEN CAST(strftime('%M', reading_timestamp) AS INTEGER) < 30 THEN '00' ELSE '30' END)"
+            sql_expr = """concat(
+                formatDateTime(reading_timestamp, '%H'), ':',
+                if(toInt32(formatDateTime(reading_timestamp, '%M')) < 30, '00', '30')
+            )"""
             return buckets, sql_expr
         elif "15" in g or "quarter" in g:
             buckets = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 15, 30, 45)]
-            sql_expr = "(strftime('%H', reading_timestamp) || ':' || CASE WHEN CAST(strftime('%M', reading_timestamp) AS INTEGER) < 15 THEN '00' WHEN CAST(strftime('%M', reading_timestamp) AS INTEGER) < 30 THEN '15' WHEN CAST(strftime('%M', reading_timestamp) AS INTEGER) < 45 THEN '30' ELSE '45' END)"
+            sql_expr = """concat(
+                formatDateTime(reading_timestamp, '%H'), ':',
+                multiIf(
+                    toInt32(formatDateTime(reading_timestamp, '%M')) < 15, '00',
+                    toInt32(formatDateTime(reading_timestamp, '%M')) < 30, '15',
+                    toInt32(formatDateTime(reading_timestamp, '%M')) < 45, '30',
+                    '45'
+                )
+            )"""
             return buckets, sql_expr
         else:
             buckets = [f"{h:02d}:00" for h in range(24)]
-            sql_expr = "strftime('%H:00', reading_timestamp)"
+            sql_expr = "formatDateTime(reading_timestamp, '%H:00')"
             return buckets, sql_expr
 
     @classmethod
@@ -131,11 +158,15 @@ class AggregationService:
         if aggregation_type == "specific_equipment" or equipment:
             return cls._aggregate_specific_equipment(start_d, end_d, granularity, equipment, chart_type)
 
-        # 5. Facility Incomer Trend
+        # 5. Solar Generation Aggregation
+        if aggregation_type == "solar":
+            return cls._aggregate_solar(start_d, end_d, granularity, chart_type)
+
+        # 6. Facility Incomer Trend
         if aggregation_type == "facility":
             return cls._aggregate_facility(start_d, end_d, granularity, chart_type)
 
-        # 6. Default: Equipment-Wise Category Aggregation
+        # 7. Default: Equipment-Wise Category Aggregation
         return cls._aggregate_equipment_categories(start_d, end_d, granularity, chart_type)
 
     @classmethod
@@ -146,29 +177,31 @@ class AggregationService:
         granularity: str,
         chart_type: str
     ) -> Dict[str, Any]:
-        """Aggregate the 8 standard equipment categories."""
+        """Aggregate the 8 standard equipment categories using ClickHouse native queries."""
         is_multi_day = start_date != end_date
+        excluded_list = ", ".join(f"'{t}'" for t in CATEGORY_EXCLUDED_TAGS)
 
         # Sub-Daily (Hourly, 30-min, 15-min) Equipment Category Telemetry
         g_lower = (granularity or "").lower()
         if g_lower in ("hourly", "30min", "15min", "30_min", "15_min") or any(k in g_lower for k in ("30", "15", "hour")):
             intervals, bucket_sql = cls._get_time_buckets(granularity)
-            excluded_sql = "', '".join(CATEGORY_EXCLUDED_TAGS)
 
             q = f"""
                 SELECT category, bucket, ROUND(SUM(delta), 1) as kwh
                 FROM (
-                    SELECT CASE 
-                             WHEN SUBSTR(tag_id, 1, INSTR(tag_id, '.') - 1) = 'Other' THEN 'Others'
-                             ELSE SUBSTR(tag_id, 1, INSTR(tag_id, '.') - 1)
-                           END as category,
-                           tag_id,
-                           MAX(value) - MIN(value) as delta,
-                           {bucket_sql} as bucket
+                    SELECT
+                        CASE
+                            WHEN splitByChar('.', tag_id)[1] = 'Other' THEN 'Others'
+                            ELSE splitByChar('.', tag_id)[1]
+                        END as category,
+                        tag_id,
+                        max(toFloat64OrNull(value)) - min(toFloat64OrNull(value)) as delta,
+                        {bucket_sql} as bucket
                     FROM opcda_readings
-                    WHERE reading_timestamp >= ? AND reading_timestamp < ?
+                    WHERE reading_timestamp >= parseDateTimeBestEffort({{start_ts:String}})
+                      AND reading_timestamp < parseDateTimeBestEffort({{end_ts:String}})
                       AND tag_id LIKE '%Energies/Real Energy/Real Energy Into the Load'
-                      AND tag_id NOT IN ('{excluded_sql}')
+                      AND tag_id NOT IN ({excluded_list})
                     GROUP BY tag_id, bucket
                 )
                 GROUP BY category, bucket
@@ -176,7 +209,7 @@ class AggregationService:
             """
             start_ts = f"{start_date} 00:00:00"
             end_ts = f"{start_date} 23:59:59"
-            rows = db_client.execute_query(q, (start_ts, end_ts))
+            rows = db_client.execute_query(q, {"start_ts": start_ts, "end_ts": end_ts})
 
             cat_map: Dict[str, Dict[str, float]] = {}
             for r in rows:
@@ -234,18 +267,26 @@ class AggregationService:
             }
 
         if not is_multi_day:
-            # Single day category breakdown
+            # Single day category breakdown from rollup table
             q = f"""
-                SELECT SUBSTR(tag_id, 1, INSTR(tag_id, '.') - 1) as category,
-                       ROUND(SUM(energy), 1) as energy_kwh
-                FROM tag_daily_energy_rollup
-                WHERE date = ?
-                  AND tag_id LIKE '%Energies/Real Energy/Real Energy Into the Load'
-                  AND tag_id NOT IN ('{"', '".join(CATEGORY_EXCLUDED_TAGS)}')
+                SELECT
+                    category,
+                    ROUND(SUM(tag_energy), 1) as energy_kwh
+                FROM (
+                    SELECT
+                        splitByChar('.', tag_id)[1] as category,
+                        tag_id,
+                        maxMerge(max_value) - minMerge(min_value) as tag_energy
+                    FROM tag_daily_energy_rollup
+                    WHERE day = toDate({{date:String}})
+                      AND tag_id LIKE '%Energies/Real Energy/Real Energy Into the Load'
+                      AND tag_id NOT IN ({excluded_list})
+                    GROUP BY tag_id
+                )
                 GROUP BY category
                 ORDER BY energy_kwh DESC;
             """
-            rows = db_client.execute_query(q, (start_date,))
+            rows = db_client.execute_query(q, {"date": start_date})
             categories = [r["category"] for r in rows if r["category"] in EQUIPMENT_WISE_CATEGORIES]
             values = [float(r["energy_kwh"] or 0) for r in rows if r["category"] in EQUIPMENT_WISE_CATEGORIES]
             total_kwh = round(sum(values), 1)
@@ -301,18 +342,28 @@ class AggregationService:
 
         # Multi-day category aggregation
         q = f"""
-            SELECT date,
-                   SUBSTR(tag_id, 1, INSTR(tag_id, '.') - 1) as category,
-                   ROUND(SUM(energy), 1) as energy_kwh
-            FROM tag_daily_energy_rollup
-            WHERE date >= ? AND date <= ?
-              AND tag_id LIKE '%Energies/Real Energy/Real Energy Into the Load'
-              AND tag_id NOT IN ('{"', '".join(CATEGORY_EXCLUDED_TAGS)}')
-            GROUP BY date, category
-            ORDER BY date ASC;
+            SELECT
+                toString(day) as date,
+                category,
+                ROUND(SUM(tag_energy), 1) as energy_kwh
+            FROM (
+                SELECT
+                    day,
+                    splitByChar('.', tag_id)[1] as category,
+                    tag_id,
+                    maxMerge(max_value) - minMerge(min_value) as tag_energy
+                FROM tag_daily_energy_rollup
+                WHERE day >= toDate({{start_date:String}})
+                  AND day <= toDate({{end_date:String}})
+                  AND tag_id LIKE '%Energies/Real Energy/Real Energy Into the Load'
+                  AND tag_id NOT IN ({excluded_list})
+                GROUP BY day, tag_id
+            )
+            GROUP BY day, category
+            ORDER BY day ASC, category;
         """
-        rows = db_client.execute_query(q, (start_date, end_date))
-        dates = sorted(list(set(r["date"] for r in rows)))
+        rows = db_client.execute_query(q, {"start_date": start_date, "end_date": end_date})
+        dates = sorted(list(set(str(r["date"]) for r in rows)))
         cat_map: Dict[str, Dict[str, float]] = {c: {} for c in EQUIPMENT_WISE_CATEGORIES}
 
         total_kwh = 0.0
@@ -320,7 +371,7 @@ class AggregationService:
             c = r["category"]
             if c in cat_map:
                 val = float(r["energy_kwh"] or 0)
-                cat_map[c][r["date"]] = val
+                cat_map[c][str(r["date"])] = val
                 total_kwh += val
 
         series_list: List[ChartSeries] = []
@@ -365,7 +416,7 @@ class AggregationService:
         selected_zones: Optional[Union[str, List[str]]],
         chart_type: str
     ) -> Dict[str, Any]:
-        """Aggregate 17 organizational cost centers or filtered zones."""
+        """Aggregate 17 organizational cost centers or filtered zones using ClickHouse."""
         zone_keys = list(COST_CENTER_MAPPINGS.keys())
         if selected_zones and selected_zones != "all":
             filter_list = [selected_zones] if isinstance(selected_zones, str) else selected_zones
@@ -381,28 +432,29 @@ class AggregationService:
             total_kwh = 0.0
             time_table: Dict[str, Dict[str, float]] = {t: {} for t in intervals}
 
-            for i, cc in enumerate(zone_keys[:8]):
+            for i, cc in enumerate(zone_keys):  # All zones (up to 17)
                 tags = COST_CENTER_MAPPINGS.get(cc, [])
                 if not tags:
                     continue
-                placeholders = ",".join(["?"] * len(tags))
+                tag_list = ", ".join(f"'{t}'" for t in tags)
                 q = f"""
-                    SELECT bucket,
-                           ROUND(SUM(delta), 1) as kwh
+                    SELECT bucket, ROUND(SUM(delta), 1) as kwh
                     FROM (
-                        SELECT tag_id, reading_timestamp,
-                               MAX(value) - MIN(value) as delta,
-                               {bucket_sql} as bucket
+                        SELECT
+                            tag_id,
+                            max(toFloat64OrNull(value)) - min(toFloat64OrNull(value)) as delta,
+                            {bucket_sql} as bucket
                         FROM opcda_readings
-                        WHERE reading_timestamp >= ? AND reading_timestamp < ?
-                          AND tag_id IN ({placeholders})
+                        WHERE reading_timestamp >= parseDateTimeBestEffort({{start_ts:String}})
+                          AND reading_timestamp < parseDateTimeBestEffort({{end_ts:String}})
+                          AND tag_id IN ({tag_list})
                         GROUP BY tag_id, bucket
                     )
                     GROUP BY bucket ORDER BY bucket ASC;
                 """
                 start_ts = f"{start_date} 00:00:00"
                 end_ts = f"{start_date} 23:59:59"
-                rows = db_client.execute_query(q, [start_ts, end_ts] + tags)
+                rows = db_client.execute_query(q, {"start_ts": start_ts, "end_ts": end_ts})
                 b_map = {r["bucket"]: float(r["kwh"] or 0) for r in rows}
                 vals = [round(b_map.get(t, 0.0), 1) for t in intervals]
                 z_total = round(sum(vals), 1)
@@ -448,13 +500,20 @@ class AggregationService:
             total_kwh = 0.0
             for cc in zone_keys:
                 tags = COST_CENTER_MAPPINGS[cc]
-                placeholders = ",".join("?" for _ in tags)
+                tag_list = ", ".join(f"'{t}'" for t in tags)
                 q = f"""
-                    SELECT SUM(energy) AS cc_energy
-                    FROM tag_daily_energy_rollup
-                    WHERE date = ? AND tag_id IN ({placeholders});
+                    SELECT ROUND(SUM(tag_energy), 1) as cc_energy
+                    FROM (
+                        SELECT
+                            tag_id,
+                            maxMerge(max_value) - minMerge(min_value) as tag_energy
+                        FROM tag_daily_energy_rollup
+                        WHERE day = toDate({{date:String}})
+                          AND tag_id IN ({tag_list})
+                        GROUP BY tag_id
+                    );
                 """
-                rows = db_client.execute_query(q, [start_date] + tags)
+                rows = db_client.execute_query(q, {"date": start_date})
                 val = round(float(rows[0]["cc_energy"]), 1) if (rows and rows[0]["cc_energy"] is not None) else 0.0
                 total_kwh += val
                 cost_centers.append({"cost_center": cc, "energy_kwh": val})
@@ -499,21 +558,35 @@ class AggregationService:
             }
 
         # Multi-day zone aggregation
-        dates_q = "SELECT DISTINCT date FROM tag_daily_energy_rollup WHERE date >= ? AND date <= ? ORDER BY date ASC"
-        dates = [r["date"] for r in db_client.execute_query(dates_q, (start_date, end_date))]
+        dates_q = """
+            SELECT DISTINCT toString(day) as date
+            FROM tag_daily_energy_rollup
+            WHERE day >= toDate({start_date:String}) AND day <= toDate({end_date:String})
+            ORDER BY day ASC
+        """
+        dates = [r["date"] for r in db_client.execute_query(dates_q, {"start_date": start_date, "end_date": end_date})]
 
         zone_data: Dict[str, List[float]] = {}
         total_kwh = 0.0
-        for cc in zone_keys[:10]:  # Top 10 zones to avoid visual crowding
+        for cc in zone_keys:  # All zones (up to 17)
             tags = COST_CENTER_MAPPINGS[cc]
-            placeholders = ",".join("?" for _ in tags)
+            tag_list = ", ".join(f"'{t}'" for t in tags)
             q = f"""
-                SELECT date, SUM(energy) as cc_energy
-                FROM tag_daily_energy_rollup
-                WHERE date >= ? AND date <= ? AND tag_id IN ({placeholders})
-                GROUP BY date ORDER BY date ASC;
+                SELECT toString(day) as date, ROUND(SUM(tag_energy), 1) as cc_energy
+                FROM (
+                    SELECT
+                        day,
+                        tag_id,
+                        maxMerge(max_value) - minMerge(min_value) as tag_energy
+                    FROM tag_daily_energy_rollup
+                    WHERE day >= toDate({{start_date:String}})
+                      AND day <= toDate({{end_date:String}})
+                      AND tag_id IN ({tag_list})
+                    GROUP BY day, tag_id
+                )
+                GROUP BY day ORDER BY day ASC;
             """
-            rows = db_client.execute_query(q, [start_date, end_date] + tags)
+            rows = db_client.execute_query(q, {"start_date": start_date, "end_date": end_date})
             row_map = {r["date"]: round(float(r["cc_energy"] or 0), 1) for r in rows}
             zone_vals = [row_map.get(d, 0.0) for d in dates]
             zone_data[cc] = zone_vals
@@ -553,23 +626,27 @@ class AggregationService:
         equipment: Union[str, List[str]],
         chart_type: str
     ) -> Dict[str, Any]:
-        """Aggregate telemetry for specific equipment machines or array of machines."""
+        """Aggregate telemetry for specific equipment machines using ClickHouse."""
         eq_list = [equipment] if isinstance(equipment, str) else equipment
         eq_patterns = [e.strip().replace(" ", "_") for e in eq_list]
 
-        like_clauses = " OR ".join(["tag_id LIKE ?" for _ in eq_patterns])
-        like_params = [f"%{p}%" for p in eq_patterns]
+        like_clauses = " OR ".join([f"tag_id LIKE '%{p}%'" for p in eq_patterns])
 
         # Query all matching meter rollups
         q = f"""
-            SELECT date, tag_id, energy
+            SELECT
+                toString(day) as date,
+                tag_id,
+                maxMerge(max_value) - minMerge(min_value) as energy
             FROM tag_daily_energy_rollup
-            WHERE date >= ? AND date <= ?
+            WHERE day >= toDate({{start_date:String}})
+              AND day <= toDate({{end_date:String}})
               AND ({like_clauses})
               AND tag_id LIKE '%Real Energy%'
-            ORDER BY date ASC;
+            GROUP BY day, tag_id
+            ORDER BY day ASC;
         """
-        rows = db_client.execute_query(q, [start_date, end_date] + like_params)
+        rows = db_client.execute_query(q, {"start_date": start_date, "end_date": end_date})
         distinct_tags = sorted(list(set(r["tag_id"] for r in rows)))
 
         # Simplify names (e.g. 'Airconditioning.Chiller_1/...' -> 'Chiller 1')
@@ -587,20 +664,22 @@ class AggregationService:
             series_list = []
             total_kwh = 0.0
 
-            for i, t in enumerate(distinct_tags[:8]):
+            for i, t in enumerate(distinct_tags):  # All matched equipment
                 name = tag_display_names[t]
-                q = f"""
-                    SELECT strftime('%H:00', reading_timestamp) as hour,
-                           ROUND(MAX(value) - MIN(value), 1) as delta_kwh
+                q = """
+                    SELECT
+                        formatDateTime(reading_timestamp, '%H:00') as hour,
+                        ROUND(max(toFloat64OrNull(value)) - min(toFloat64OrNull(value)), 1) as delta_kwh
                     FROM opcda_readings
-                    WHERE tag_id = ?
-                      AND reading_timestamp >= ? AND reading_timestamp < ?
+                    WHERE tag_id = {tag_id:String}
+                      AND reading_timestamp >= parseDateTimeBestEffort({start_ts:String})
+                      AND reading_timestamp < parseDateTimeBestEffort({end_ts:String})
                     GROUP BY hour ORDER BY hour ASC;
                 """
                 start_ts = f"{start_date} 00:00:00"
                 end_ts = f"{start_date} 23:59:59"
-                rows = db_client.execute_query(q, (t, start_ts, end_ts))
-                h_map = {r["hour"]: float(r["delta_kwh"] or 0) for r in rows}
+                hour_rows = db_client.execute_query(q, {"tag_id": t, "start_ts": start_ts, "end_ts": end_ts})
+                h_map = {r["hour"]: float(r["delta_kwh"] or 0) for r in hour_rows}
                 vals = [round(h_map.get(h, 0.0), 1) for h in hours]
                 total_kwh += sum(vals)
 
@@ -634,7 +713,7 @@ class AggregationService:
             }
 
         is_multi_day = start_date != end_date
-        dates = sorted(list(set(r["date"] for r in rows))) if is_multi_day else [start_date]
+        dates = sorted(list(set(str(r["date"]) for r in rows))) if is_multi_day else [start_date]
 
         total_kwh = 0.0
         equipment_summary = []
@@ -664,7 +743,7 @@ class AggregationService:
             series_list = []
             tag_date_map: Dict[str, Dict[str, float]] = {t: {} for t in distinct_tags}
             for r in rows:
-                tag_date_map[r["tag_id"]][r["date"]] = round(float(r["energy"] or 0), 1)
+                tag_date_map[r["tag_id"]][str(r["date"])] = round(float(r["energy"] or 0), 1)
                 total_kwh += float(r["energy"] or 0)
 
             for i, t in enumerate(distinct_tags):
@@ -700,6 +779,95 @@ class AggregationService:
         }
 
     @classmethod
+    def _aggregate_solar(
+        cls,
+        start_date: str,
+        end_date: str,
+        granularity: str,
+        chart_type: str
+    ) -> Dict[str, Any]:
+        """Aggregate rooftop solar generation (Incomer.Incomer_Solar_100kW) using ClickHouse."""
+        is_multi_day = start_date != end_date
+
+        if not is_multi_day and granularity == "hourly":
+            # 24-Hour solar generation profile
+            q = """
+                SELECT
+                    formatDateTime(reading_timestamp, '%H:00') as hour,
+                    round(max(toFloat64OrNull(value)) - min(toFloat64OrNull(value)), 1) as delta_kwh
+                FROM opcda_readings
+                WHERE tag_id = {tag_id:String}
+                  AND reading_timestamp >= parseDateTimeBestEffort({start_ts:String})
+                  AND reading_timestamp <= parseDateTimeBestEffort({end_ts:String})
+                GROUP BY hour ORDER BY hour ASC;
+            """
+            start_ts = f"{start_date} 00:00:00"
+            end_ts = f"{start_date} 23:59:59"
+            rows = db_client.execute_query(q, {"tag_id": SOLAR_ENERGY_TAG, "start_ts": start_ts, "end_ts": end_ts})
+            row_map = {r["hour"]: float(r["delta_kwh"] or 0) for r in rows}
+            hours = [f"{h:02d}:00" for h in range(24)]
+            vals = [round(row_map.get(h, 0.0), 1) for h in hours]
+            total_kwh = round(sum(vals), 1)
+
+            sel_chart = chart_type if chart_type != "auto" else "area"
+            config = ChartConfig(
+                chart_type=sel_chart,
+                title=f"24-Hour Solar Generation Profile ({start_date})",
+                subtitle=f"Rooftop 100kW Solar Plant | Total Generation: {total_kwh:,.1f} kWh",
+                x_axis_label="Hour of Day (IST)",
+                x_labels=hours,
+                y_axis_label="Solar Energy (kWh)",
+                series=[ChartSeries(name="Solar Generation (kWh)", data=vals, color="#EAB308", unit="kWh")],
+                representation_reason="Hourly rooftop solar power generation curve."
+            )
+            return {
+                "status": "success",
+                "aggregation_type": "solar",
+                "date": start_date,
+                "granularity": "hourly",
+                "total_energy_kwh": total_kwh,
+                "chart_config": config.model_dump()
+            }
+
+        # Multi-day solar trend
+        q = """
+            SELECT
+                toString(day) as date,
+                ROUND(maxMerge(max_value) - minMerge(min_value), 1) as energy
+            FROM tag_daily_energy_rollup
+            WHERE tag_id = {tag_id:String}
+              AND day >= toDate({start_date:String})
+              AND day <= toDate({end_date:String})
+            GROUP BY day
+            ORDER BY day ASC;
+        """
+        rows = db_client.execute_query(q, {"tag_id": SOLAR_ENERGY_TAG, "start_date": start_date, "end_date": end_date})
+        dates = [r["date"] for r in rows]
+        vals = [round(float(r["energy"] or 0), 1) for r in rows]
+        total_kwh = round(sum(vals), 1)
+
+        sel_chart = chart_type if chart_type != "auto" else "line"
+        config = ChartConfig(
+            chart_type=sel_chart,
+            title=f"Daily Solar Generation ({start_date} to {end_date})",
+            subtitle=f"Rooftop 100kW Solar | Total: {total_kwh:,.1f} kWh | Avg: {round(total_kwh / max(len(dates), 1), 1):,.1f} kWh/day",
+            x_axis_label="Date",
+            x_labels=dates,
+            y_axis_label="Daily Solar Energy (kWh)",
+            series=[ChartSeries(name="Daily Solar (kWh)", data=vals, color="#EAB308", unit="kWh")],
+            representation_reason="Multi-day rooftop solar energy generation trend."
+        )
+        return {
+            "status": "success",
+            "aggregation_type": "solar",
+            "date_range": {"start_date": start_date, "end_date": end_date},
+            "granularity": "daily",
+            "days_count": len(dates),
+            "total_energy_kwh": total_kwh,
+            "chart_config": config.model_dump()
+        }
+
+    @classmethod
     def _aggregate_facility(
         cls,
         start_date: str,
@@ -707,21 +875,24 @@ class AggregationService:
         granularity: str,
         chart_type: str
     ) -> Dict[str, Any]:
-        """Aggregate total grid facility incomer energy."""
+        """Aggregate total grid facility incomer energy using ClickHouse."""
         is_multi_day = start_date != end_date
 
         if not is_multi_day and granularity == "hourly":
             # 24-Hour load curve
-            q = f"""
-                SELECT strftime('%H:00', reading_timestamp) as hour,
-                       MAX(value) - MIN(value) as delta_kwh
+            q = """
+                SELECT
+                    formatDateTime(reading_timestamp, '%H:00') as hour,
+                    max(toFloat64OrNull(value)) - min(toFloat64OrNull(value)) as delta_kwh
                 FROM opcda_readings
-                WHERE tag_id = '{SHIFT_ENERGY_TAG}'
-                  AND reading_timestamp >= '{start_date} 00:00:00'
-                  AND reading_timestamp < '{start_date} 23:59:59'
+                WHERE tag_id = {tag_id:String}
+                  AND reading_timestamp >= parseDateTimeBestEffort({start_ts:String})
+                  AND reading_timestamp < parseDateTimeBestEffort({end_ts:String})
                 GROUP BY hour ORDER BY hour ASC;
             """
-            rows = db_client.execute_query(q)
+            start_ts = f"{start_date} 00:00:00"
+            end_ts = f"{start_date} 23:59:59"
+            rows = db_client.execute_query(q, {"tag_id": SHIFT_ENERGY_TAG, "start_ts": start_ts, "end_ts": end_ts})
             hours = [r["hour"] for r in rows]
             vals = [round(float(r["delta_kwh"] or 0), 1) for r in rows]
             total_kwh = round(sum(vals), 1)
@@ -748,12 +919,17 @@ class AggregationService:
 
         # Multi-day facility trend
         q = """
-            SELECT date, energy
+            SELECT
+                toString(day) as date,
+                ROUND(maxMerge(max_value) - minMerge(min_value), 1) as energy
             FROM tag_daily_energy_rollup
-            WHERE tag_id = ? AND date >= ? AND date <= ?
-            ORDER BY date ASC;
+            WHERE tag_id = {tag_id:String}
+              AND day >= toDate({start_date:String})
+              AND day <= toDate({end_date:String})
+            GROUP BY day
+            ORDER BY day ASC;
         """
-        rows = db_client.execute_query(q, (SHIFT_ENERGY_TAG, start_date, end_date))
+        rows = db_client.execute_query(q, {"tag_id": SHIFT_ENERGY_TAG, "start_date": start_date, "end_date": end_date})
         dates = [r["date"] for r in rows]
         vals = [round(float(r["energy"] or 0), 1) for r in rows]
         total_kwh = round(sum(vals), 1)
@@ -792,32 +968,37 @@ class AggregationService:
         combining Hourly Energy (kWh, left axis), Apparent Power (kVA, left axis),
         and Power Factor / THD (right axis).
         """
-        q_power = f"""
-            SELECT strftime('%H:00', reading_timestamp) as hour,
-                   AVG(value) as avg_kva,
-                   MAX(value) as peak_kva
+        q_power = """
+            SELECT
+                formatDateTime(reading_timestamp, '%H:00') as hour,
+                AVG(toFloat64OrNull(value)) as avg_kva,
+                MAX(toFloat64OrNull(value)) as peak_kva
             FROM opcda_readings
-            WHERE tag_id = '{PEAK_DEMAND_TAG}'
-              AND reading_timestamp >= '{start_date} 00:00:00'
-              AND reading_timestamp < '{start_date} 23:59:59'
+            WHERE tag_id = {tag_id:String}
+              AND reading_timestamp >= parseDateTimeBestEffort({start_ts:String})
+              AND reading_timestamp < parseDateTimeBestEffort({end_ts:String})
             GROUP BY hour ORDER BY hour ASC;
         """
-        power_rows = db_client.execute_query(q_power)
+        start_ts = f"{start_date} 00:00:00"
+        end_ts = f"{start_date} 23:59:59"
+        power_rows = db_client.execute_query(q_power, {"tag_id": PEAK_DEMAND_TAG, "start_ts": start_ts, "end_ts": end_ts})
         hours = [r["hour"] for r in power_rows]
         kva_vals = [round(float(r["avg_kva"] or 0), 1) for r in power_rows]
         peak_kva_vals = [round(float(r["peak_kva"] or 0), 1) for r in power_rows]
 
         # Power factor
-        q_pf = f"""
-            SELECT strftime('%H:00', reading_timestamp) as hour,
-                   ROUND(AVG(value) / 100.0, 2) as avg_pf
+        pf_pattern = f"{AUTHORITATIVE_TRANSFORMER_PREFIX}Power Factors/Power Factor Total%"
+        q_pf = """
+            SELECT
+                formatDateTime(reading_timestamp, '%H:00') as hour,
+                ROUND(AVG(toFloat64OrNull(value)) / 100.0, 2) as avg_pf
             FROM opcda_readings
-            WHERE tag_id LIKE '{AUTHORITATIVE_TRANSFORMER_PREFIX}Power Factors/Power Factor Total%'
-              AND reading_timestamp >= '{start_date} 00:00:00'
-              AND reading_timestamp < '{start_date} 23:59:59'
+            WHERE tag_id LIKE {pattern:String}
+              AND reading_timestamp >= parseDateTimeBestEffort({start_ts:String})
+              AND reading_timestamp < parseDateTimeBestEffort({end_ts:String})
             GROUP BY hour ORDER BY hour ASC;
         """
-        pf_rows = db_client.execute_query(q_pf)
+        pf_rows = db_client.execute_query(q_pf, {"pattern": pf_pattern, "start_ts": start_ts, "end_ts": end_ts})
         pf_map = {r["hour"]: float(r["avg_pf"] or 0.95) for r in pf_rows}
         pf_vals = [pf_map.get(h, 0.95) for h in hours]
 
@@ -924,5 +1105,6 @@ class AggregationService:
             "dimensions": dimensions,
             "chart_config": config.model_dump()
         }
+
 
 aggregation_service = AggregationService()

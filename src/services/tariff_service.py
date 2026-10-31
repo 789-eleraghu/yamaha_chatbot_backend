@@ -6,8 +6,8 @@ Implements Section 3 of energy-ai-assistant-reference.md
 from typing import Any, Dict, List
 from src.core.constants import HOURLY_TARIFF_RATES, SHIFT_ENERGY_TAG
 from src.core.normalizers import normalize_date_str
-from src.db.sqlite_client import db_client
-from src.services.energy_service import EnergyService
+from src.db.client import db_client
+from src.services.telemetry import facility_telemetry
 
 class TariffService:
     @staticmethod
@@ -22,7 +22,7 @@ class TariffService:
         """
         date_str = normalize_date_str(date_str)
         # 1. True daily kWh
-        daily_info = EnergyService.get_facility_daily_energy(date_str)
+        daily_info = facility_telemetry.get_grid_energy(date_str)
         true_daily_kwh = daily_info.get("energy_kwh")
         if true_daily_kwh is None or true_daily_kwh <= 0:
             return {"date": date_str, "error": "No valid consumption data for date"}

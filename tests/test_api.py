@@ -18,7 +18,7 @@ def test_health():
     data = response.json()
     assert data["status"] == "healthy"
     assert data["database_status"] == "healthy"
-    assert data["database_type"] == "sqlite"
+    assert data["database_type"] in ("sqlite", "clickhouse")
 
 def test_out_of_domain_query_skips_tools_and_fallbacks():
     response = client.post("/api/chat", json={"message": "who won the cricket match today?"})

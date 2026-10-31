@@ -14,3 +14,12 @@ pydantic-settings>=2.5,<3
 # SQL & Database
 SQLAlchemy>=2.0.35,<3
 aiosqlite>=0.20
+
+# NeMo Guardrails
+nemoguardrails>=0.10.0
+
+# Database - PostgreSQL
+psycopg2-binary>=2.9.9
+
+# Authentication
+PyJWT>=2.8.0

@@ -11,8 +11,10 @@ load_dotenv(override=True)
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from src.core.config import settings
+from src.api.routes.auth import router as auth_router
 from src.api.routes.chat import router as chat_router
 from src.api.routes.health import router as health_router
+from src.api.routes.monitoring import router as monitoring_router
 
 app = FastAPI(
     title="Yamaha Energy AI Assistant API",
@@ -29,8 +31,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth_router, prefix="/api")
 app.include_router(health_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
+app.include_router(monitoring_router, prefix="/api")
+
+# Dual-mount without /api prefix for backwards compatibility with Nginx proxy_pass & direct /chat callers
+app.include_router(auth_router)
+app.include_router(health_router)
+app.include_router(chat_router)
+app.include_router(monitoring_router)
 
 @app.get("/")
 def root():

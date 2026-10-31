@@ -11,8 +11,7 @@ from src.core.normalizers import (
 )
 from src.tools.util_tools import search_tag_catalog
 from src.rag.retriever import ems_kb
-from src.services.energy_service import EnergyService
-from src.services.shift_service import ShiftService
+from src.services.telemetry import facility_telemetry
 from src.services.tariff_service import TariffService
 
 def test_normalize_date_str_variations():
@@ -87,10 +86,10 @@ def test_ems_kb_search_with_typos():
 
 def test_services_with_varied_date_inputs():
     # Service calls with non-canonical date formats
-    res_energy = EnergyService.get_facility_daily_energy(" 2026-10-15 ")
+    res_energy = facility_telemetry.get_grid_energy(" 2026-10-15 ")
     assert res_energy["energy_kwh"] > 0
 
-    res_shift = ShiftService.get_shift_consumption("15-10-2026")
+    res_shift = facility_telemetry.get_grid_shift_energy("15-10-2026")
     assert res_shift["total_shifts_kwh"] > 0
 
     res_tariff = TariffService.calculate_daily_cost("2026/10/15")

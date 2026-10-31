@@ -1,19 +1,20 @@
 """
-Advanced Graph & Chart Generation Tools
-Supports:
-- Line, Area, Stacked Area (time-series & load curves)
-- Bar, Stacked Bar, Grouped Bar (comparisons & shift compositions)
-- Pie, Donut (part-to-whole, category distribution, cost center share)
-- Scatter, Pair Plot (correlations: Steam Flow vs Pressure, kW vs THD, kVA vs PF)
-- Gauge / Radial (Peak Demand utilization % vs 1475 kVA contract & 1180 kVA threshold)
-- 2D Heatmap (Hour-of-day 00:00-23:00 vs Date load matrix)
-Selects and formats the best visual representation based on user requirements.
+Optimized Chart & Visualization Tools (Consolidated)
+
+3 tools replacing 7:
+1. create_chart - Primary unified tool for all energy/zone/equipment charts
+2. create_power_quality_chart - THD, demand profiles with threshold lines
+3. create_specialized_chart - Gauge, scatter plots, heatmaps
+
+All tools return both numerical data AND ready-to-render ChartConfig payloads.
 """
 
 import datetime
 from typing import Any, Dict, List, Literal, Optional
+
 from langchain_core.tools import tool
 
+from src.core.config import settings
 from src.core.constants import (
     CONTRACTED_DEMAND_KVA,
     PEAK_DEMAND_THRESHOLD_KVA,
@@ -24,7 +25,8 @@ from src.core.constants import (
     CURRENT_THD_TAGS,
     SHIFT_ENERGY_TAG,
 )
-from src.db.sqlite_client import db_client
+from src.core.normalizers import normalize_date_str
+from src.db.client import db_client
 from src.schemas.charts import (
     ChartConfig,
     ChartSeries,
@@ -33,110 +35,686 @@ from src.schemas.charts import (
     ScatterPoint,
     ScatterSeries,
 )
-from src.services.breakdown_service import BreakdownService
-from src.services.demand_service import DemandService
-from src.services.shift_service import ShiftService
-from src.services.tariff_service import TariffService
-from src.core.normalizers import normalize_date_str
+from src.services.aggregation_service import aggregation_service
+from src.services.telemetry import facility_telemetry
 
-# Industrial Color Palettes
-PALETTE = [
-    "#2563EB",  # Electric Blue
-    "#059669",  # Emerald Green
-    "#D97706",  # Amber
-    "#DC2626",  # Crimson
-    "#7C3AED",  # Purple
-    "#0891B2",  # Cyan
-    "#DB2777",  # Pink
-    "#4B5563",  # Slate
-]
+
+# ==============================================================================
+# Helper Functions
+# ==============================================================================
+
+def _validate_date(date_str: str) -> tuple[bool, str, str]:
+    """Validate and normalize date string. Returns (is_valid, normalized_date, error_msg)."""
+    try:
+        normalized = normalize_date_str(date_str)
+        return True, normalized, ""
+    except Exception as e:
+        return False, "", f"Invalid date: {date_str}. Use YYYY-MM-DD format. Error: {e}"
+
+
+def _safe_call(func, *args, **kwargs) -> Dict[str, Any]:
+    """Wrap service calls with error handling."""
+    try:
+        return func(*args, **kwargs)
+    except Exception as e:
+        return {"error": str(e), "success": False}
+
+
+# ==============================================================================
+# Tool 1: Primary Unified Chart Tool
+# ==============================================================================
 
 @tool
-def create_breakdown_chart(
-    date: str,
-    breakdown_type: Literal["equipment_wise", "zone_wise", "tariff_bands"],
-    preferred_type: Literal["auto", "donut", "pie", "bar", "stacked_bar"] = "auto"
+def create_chart(
+    chart_for: Literal[
+        "equipment",
+        "zones",
+        "facility",
+        "solar",
+        "shift",
+        "tariff",
+        "specific_equipment"
+    ],
+    start_date: str = "yesterday",
+    end_date: Optional[str] = None,
+    granularity: Literal["daily", "hourly", "30min", "15min", "shift_wise"] = "daily",
+    chart_type: Literal[
+        "auto",
+        "bar",
+        "grouped_bar",
+        "stacked_bar",
+        "horizontal_bar",
+        "line",
+        "area",
+        "stacked_area",
+        "donut",
+        "pie",
+        "treemap",
+        "radial_bar"
+    ] = "auto",
+    filter_items: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
-    Generate an optimal breakdown visualization (Donut, Pie, or Bar chart):
-    - 'equipment_wise': 8 categories (Lighting, Molding, etc.) with exclusions applied.
-    - 'zone_wise': 17 organizational cost centers.
-    - 'tariff_bands': Off-Peak, Normal, and Peak kWh and Cost share.
-    Selects Donut with Center KPI for proportions, or Bar for ranked comparisons.
+    🎯 PRIMARY CHART TOOL — Use this for ALL energy visualization requests.
+    Returns BOTH numerical breakdown AND interactive chart configuration.
+
+    CHART_FOR OPTIONS:
+    - 'equipment': 8 categories (Lighting, Molding, Compressor, Airconditioning, Dust_Collector, Paintshop, Production_Power, Others)
+    - 'zones': 17 cost centers (General Admin, AG Assy, AG Painting, PA Assy, etc.)
+    - 'facility': Total grid incomer load curve
+    - 'solar': Rooftop 100kW solar generation
+    - 'shift': Shift A (08:00-17:00), B (17:00-00:40), C (00:40-08:00) breakdown
+    - 'tariff': Off-Peak, Normal, Peak TOD band distribution
+    - 'specific_equipment': Filter to specific machines (use filter_items param)
+
+    GRANULARITY OPTIONS:
+    - 'daily' (default): Daily totals
+    - 'hourly': 24-hour intervals (00:00-23:00)
+    - '30min': 48 intervals
+    - '15min': 96 intervals
+    - 'shift_wise': Shift A/B/C breakdown
+
+    CHART_TYPE OPTIONS:
+    - 'auto' (default): Auto-select best chart type
+    - 'stacked_bar': Categories stacked, shows composition
+    - 'grouped_bar': Categories side-by-side, shows comparison
+    - 'line' / 'area': Time-series trends
+    - 'donut' / 'pie': Part-to-whole proportions (≤8 categories)
+    - 'horizontal_bar': Ranked comparison (>8 items)
+    - 'treemap': Hierarchical size comparison
+
+    FILTER_ITEMS:
+    - For 'specific_equipment': List of equipment names to filter
+    - For 'zones': List of cost center names to filter (None = all 17)
+
+    EXAMPLES:
+    - Equipment breakdown: chart_for='equipment', start_date='2026-10-21'
+    - Hourly zone comparison: chart_for='zones', granularity='hourly', chart_type='stacked_bar'
+    - Solar profile: chart_for='solar', granularity='hourly'
+    - Shift distribution: chart_for='shift', chart_type='donut'
+    - Specific zones: chart_for='zones', filter_items=['AG Assy', 'AG Painting']
     """
-    date = normalize_date_str(date)
-    if breakdown_type == "equipment_wise":
-        data = BreakdownService.get_equipment_wise_breakdown(date)
-        items = data.get("categories", [])
-        title = f"Equipment-Wise Energy Breakdown ({date})"
-        total_kwh = data.get("total_kwh", 0.0)
-        labels = [item["category"] for item in items]
-        values = [item["energy_kwh"] for item in items]
-        unit = "kWh"
-    elif breakdown_type == "zone_wise":
-        data = BreakdownService.get_zone_wise_cost_centers(date)
-        items = data.get("cost_centers", [])
-        title = f"Zone-Wise Cost Center Breakdown ({date})"
-        total_kwh = data.get("total_kwh", 0.0)
-        labels = [item["cost_center"] for item in items]
-        values = [item["energy_kwh"] for item in items]
-        unit = "kWh"
-    elif breakdown_type == "tariff_bands":
-        tariff_data = TariffService.calculate_daily_cost(date)
-        bands = tariff_data.get("band_summary", {})
-        title = f"TOD Tariff Band Energy Share ({date})"
-        total_kwh = tariff_data.get("true_daily_kwh", 0.0)
-        labels = list(bands.keys())
-        values = [b["kwh"] for b in bands.values()]
-        items = [{"band": k, "kwh": v["kwh"]} for k, v in bands.items()]
-        unit = "kWh"
-    else:
-        return {"error": f"Unknown breakdown_type: {breakdown_type}"}
+    # Validate dates
+    valid, start_d, err = _validate_date(start_date)
+    if not valid:
+        return {"error": err}
 
-    # Best representation logic:
-    # If <= 8 slices and preferred_type is auto -> Donut with Center KPI is the most readable
-    # If > 10 items (like 17 cost centers) and preferred_type is auto -> Bar chart prevents slice crowding
-    if preferred_type == "auto":
-        if len(labels) <= 8:
-            selected_type = "donut"
-            reason = "Donut chart provides the clearest representation for under 8 categorical slices, showing both relative proportions and the total facility KPI in the center."
-        else:
-            selected_type = "bar"
-            reason = f"Ranked horizontal/vertical bar chart is optimal for {len(labels)} categories to prevent label crowding and allow direct visual ranking."
-    else:
-        selected_type = preferred_type
-        reason = f"Explicitly requested {preferred_type} chart."
+    end_d = None
+    if end_date:
+        valid, end_d, err = _validate_date(end_date)
+        if not valid:
+            return {"error": err}
 
-    series = [
-        ChartSeries(
-            name=f"Consumption ({unit})",
-            data=values,
-            unit=unit
-        )
-    ]
-
-    center_kpi = {
-        "label": "Total Energy",
-        "value": f"{total_kwh:,.1f} {unit}"
+    # Map chart_for to aggregation_type
+    aggregation_map = {
+        "equipment": "equipment_wise",
+        "zones": "zone_wise",
+        "facility": "facility",
+        "solar": "solar",
+        "shift": "equipment_wise",  # Uses shift_wise granularity
+        "tariff": "tariff_bands",
+        "specific_equipment": "specific_equipment",
     }
 
-    config = ChartConfig(
-        chart_type=selected_type,
-        title=title,
-        subtitle=f"Date: {date} | Total: {total_kwh:,.1f} {unit}",
-        x_axis_label="Category / Department",
-        x_labels=labels,
-        y_axis_label=f"Energy ({unit})",
-        series=series,
-        center_kpi=center_kpi if selected_type in ("donut", "pie") else None,
-        representation_reason=reason
+    agg_type = aggregation_map.get(chart_for, "equipment_wise")
+
+    # Handle shift breakdown
+    if chart_for == "shift":
+        granularity = "shift_wise"
+
+    # Handle tariff bands (special case)
+    if chart_for == "tariff":
+        from src.services.tariff_service import TariffService
+        tariff_data = TariffService.calculate_daily_cost(start_d)
+        bands = tariff_data.get("band_summary", {})
+        total_kwh = tariff_data.get("true_daily_kwh", 0.0)
+
+        labels = list(bands.keys())
+        values = [b["kwh"] for b in bands.values()]
+        costs = [b["cost"] for b in bands.values()]
+
+        selected_type = chart_type if chart_type != "auto" else "donut"
+        series = [ChartSeries(name="Energy (kWh)", data=values, unit="kWh")]
+
+        config = ChartConfig(
+            chart_type=selected_type,
+            title=f"TOD Tariff Band Energy Distribution ({start_d})",
+            subtitle=f"Total: {total_kwh:,.1f} kWh | Total Cost: ₹{tariff_data.get('total_cost', 0):,.2f}",
+            x_axis_label="Tariff Band",
+            x_labels=labels,
+            y_axis_label="Energy (kWh)",
+            series=series,
+            center_kpi={"label": "Total Energy", "value": f"{total_kwh:,.1f} kWh"} if selected_type in ("donut", "pie") else None,
+            representation_reason="TOD tariff band distribution showing Off-Peak, Normal, and Peak energy share."
+        )
+
+        return {
+            "status": "success",
+            "chart_for": "tariff",
+            "date": start_d,
+            "total_kwh": total_kwh,
+            "total_cost": tariff_data.get("total_cost", 0),
+            "bands": [{"band": k, "kwh": v["kwh"], "cost": v["cost"]} for k, v in bands.items()],
+            "chart_config": config.model_dump()
+        }
+
+    # Call aggregation service for all other chart types
+    return _safe_call(
+        aggregation_service.aggregate,
+        aggregation_type=agg_type,
+        start_date=start_d,
+        end_date=end_d,
+        granularity=granularity,
+        equipment=filter_items if chart_for == "specific_equipment" else None,
+        zones=filter_items if chart_for == "zones" else None,
+        chart_type=chart_type
     )
-    result = config.model_dump()
-    result["total_kwh"] = total_kwh
-    result["categories"] = items
-    result["breakdown"] = items
-    result["chart_config"] = config.model_dump()
-    return result
+
+
+# ==============================================================================
+# Tool 2: Power Quality Charts with Threshold Lines
+# ==============================================================================
+
+@tool
+def create_power_quality_chart(
+    start_date: str,
+    metric: Literal["peak_demand", "voltage_thd", "current_thd", "steam_flow", "power_factor"],
+    end_date: Optional[str] = None,
+    chart_type: Literal["auto", "line", "area", "bar"] = "auto"
+) -> Dict[str, Any]:
+    """
+    Generate power quality time-series charts with compliance threshold lines.
+
+    METRIC OPTIONS:
+    - 'peak_demand': Hourly peak kVA with 1180 kVA (80%) threshold line
+    - 'voltage_thd': Hourly Voltage THD % with 5% IEEE 519 limit line
+    - 'current_thd': Hourly Current THD % with 8% limit line
+    - 'steam_flow': Hourly steam flow rate (kg/h) trend
+    - 'power_factor': Daily power factor trend with 0.95 compliance threshold
+
+    DATE RANGE:
+    - Single day (end_date=None): Hourly profile for that day
+    - Multi-day range: Daily trend from start_date to end_date (e.g., last 2 weeks)
+
+    EXAMPLES:
+    - Single day peak demand: metric='peak_demand', start_date='2026-10-21'
+    - 2-week power factor trend: metric='power_factor', start_date='2026-10-07', end_date='2026-10-21'
+    - THD compliance: metric='voltage_thd', start_date='yesterday'
+    """
+    valid, start_d, err = _validate_date(start_date)
+    if not valid:
+        return {"error": err}
+
+    # Handle multi-day range
+    end_d = None
+    is_multi_day = False
+    if end_date:
+        valid, end_d, err = _validate_date(end_date)
+        if not valid:
+            return {"error": err}
+        is_multi_day = start_d != end_d
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # POWER FACTOR TREND (supports multi-day)
+    # ─────────────────────────────────────────────────────────────────────────
+    if metric == "power_factor":
+        if is_multi_day:
+            # Multi-day power factor trend
+            dt_start = datetime.datetime.strptime(start_d, "%Y-%m-%d").date()
+            dt_end = datetime.datetime.strptime(end_d, "%Y-%m-%d").date()
+            days_count = (dt_end - dt_start).days + 1
+
+            dates = []
+            pf_values = []
+            pf_details = []
+
+            for i in range(days_count):
+                d = (dt_start + datetime.timedelta(days=i)).strftime("%Y-%m-%d")
+                pf_data = facility_telemetry.get_power_factor(d)
+
+                dates.append(d)
+                avg_pf = pf_data.get("average_power_factor", 0.0)
+                pf_values.append(round(avg_pf, 3) if avg_pf else 0.0)
+                pf_details.append({
+                    "date": d,
+                    "avg_pf": avg_pf,
+                    "min_pf": pf_data.get("min_power_factor"),
+                    "max_pf": pf_data.get("max_power_factor"),
+                    "status": pf_data.get("status", "Unknown")
+                })
+
+            # Calculate stats
+            valid_pf = [v for v in pf_values if v > 0]
+            avg_pf = round(sum(valid_pf) / len(valid_pf), 3) if valid_pf else 0.0
+            min_pf = min(valid_pf) if valid_pf else 0.0
+            max_pf = max(valid_pf) if valid_pf else 0.0
+            below_threshold = sum(1 for v in valid_pf if v < 0.95)
+
+            selected_type = "line" if chart_type == "auto" else chart_type
+            config = ChartConfig(
+                chart_type=selected_type,
+                title=f"Power Factor Trend ({start_d} to {end_d})",
+                subtitle=f"Avg: {avg_pf} | Min: {min_pf} | Max: {max_pf} | Days below 0.95: {below_threshold}",
+                x_axis_label="Date (IST)",
+                x_labels=dates,
+                y_axis_label="Power Factor",
+                threshold_line=0.95,
+                threshold_label="HT-1 Compliance Limit (0.95)",
+                series=[ChartSeries(name="Average Power Factor", data=pf_values, color="#059669", unit="PF")],
+                representation_reason="Line chart with threshold shows daily power factor compliance trend."
+            )
+            return {
+                "status": "success",
+                "metric": "power_factor",
+                "date_range": {"start": start_d, "end": end_d},
+                "days_count": days_count,
+                "average_pf": avg_pf,
+                "min_pf": min_pf,
+                "max_pf": max_pf,
+                "days_below_threshold": below_threshold,
+                "daily_breakdown": pf_details,
+                "chart_config": config.model_dump()
+            }
+        else:
+            # Single day hourly PF profile
+            pf_data = facility_telemetry.get_power_factor(start_d)
+            avg_pf = pf_data.get("average_power_factor", 0.0)
+            min_pf = pf_data.get("min_power_factor", 0.0)
+            max_pf = pf_data.get("max_power_factor", 0.0)
+
+            # For single day, return summary (no hourly PF data typically available)
+            config = ChartConfig(
+                chart_type="bar",
+                title=f"Power Factor Summary — {start_d}",
+                subtitle=f"Avg: {avg_pf} | Min: {min_pf} | Max: {max_pf} | Status: {pf_data.get('status', 'Unknown')}",
+                x_axis_label="Metric",
+                x_labels=["Average PF", "Min PF", "Max PF", "Threshold"],
+                y_axis_label="Power Factor",
+                threshold_line=0.95,
+                threshold_label="HT-1 Compliance (0.95)",
+                series=[ChartSeries(name="Power Factor", data=[avg_pf, min_pf, max_pf, 0.95], color="#059669", unit="PF")],
+                representation_reason="Bar chart shows power factor metrics against compliance threshold."
+            )
+            return {
+                "status": "success",
+                "metric": "power_factor",
+                "date": start_d,
+                "average_pf": avg_pf,
+                "min_pf": min_pf,
+                "max_pf": max_pf,
+                "phase_breakdown": pf_data.get("phase_breakdown", {}),
+                "transformer_pf": pf_data.get("transformer_power_factor", {}),
+                "compliance_status": pf_data.get("status", "Unknown"),
+                "chart_config": config.model_dump()
+            }
+
+    # For other metrics, use single-day logic
+    date_str = start_d
+    start_ts = f"{date_str} 00:00:00"
+    end_ts = f"{date_str} 23:59:59"
+
+    if metric == "peak_demand":
+        demand_data = facility_telemetry.get_peak_demand(date_str)
+        profile = demand_data.get("hourly_profile", [])
+        x_labels = [p["label"] for p in profile]
+        y_values = [p["peak_kva"] for p in profile]
+
+        selected_type = "line" if chart_type == "auto" else chart_type
+        config = ChartConfig(
+            chart_type=selected_type,
+            title=f"Hourly Peak Demand Profile (kVA) — {date_str}",
+            subtitle=f"Contracted: {CONTRACTED_DEMAND_KVA} kVA | Peak: {demand_data.get('peak_kva')} kVA ({demand_data.get('utilization_percent')}%)",
+            x_axis_label="Hour of Day (IST)",
+            x_labels=x_labels,
+            y_axis_label="Apparent Power (kVA)",
+            threshold_line=PEAK_DEMAND_THRESHOLD_KVA,
+            threshold_label=f"80% Threshold Limit ({PEAK_DEMAND_THRESHOLD_KVA} kVA)",
+            series=[ChartSeries(name="Peak Demand", data=y_values, color="#2563EB", unit="kVA")],
+            representation_reason="Line chart with threshold clearly shows demand excursions."
+        )
+        return {
+            "status": "success",
+            "metric": "peak_demand",
+            "date": date_str,
+            "peak_kva": demand_data.get("peak_kva"),
+            "utilization_percent": demand_data.get("utilization_percent"),
+            "excursion_count": len(demand_data.get("excursions", [])),
+            "chart_config": config.model_dump()
+        }
+
+    elif metric in ("voltage_thd", "current_thd"):
+        is_voltage = (metric == "voltage_thd")
+        tag = VOLTAGE_THD_TAGS[3] if is_voltage else CURRENT_THD_TAGS[0]
+        limit = 5.0 if is_voltage else 8.0
+
+        q = """
+            SELECT formatDateTime(reading_timestamp, '%H:00') AS hour_str, AVG(toFloat64OrNull(value)) AS avg_thd
+            FROM opcda_readings
+            WHERE tag_id = {tag:String}
+              AND reading_timestamp >= parseDateTimeBestEffort({start_ts:String})
+              AND reading_timestamp <= parseDateTimeBestEffort({end_ts:String})
+              AND toFloat64OrNull(value) > 0
+            GROUP BY hour_str ORDER BY hour_str ASC;
+        """
+        rows = db_client.execute_query(q, {"tag": tag, "start_ts": start_ts, "end_ts": end_ts})
+
+        x_labels = [r["hour_str"] for r in rows]
+        y_values = [round(float(r["avg_thd"]), 2) for r in rows]
+        max_thd = max(y_values) if y_values else 0.0
+        excursions = sum(1 for v in y_values if v > limit)
+
+        name = "Voltage THD (L-N)" if is_voltage else "Current THD (Phase A)"
+        config = ChartConfig(
+            chart_type="line" if chart_type == "auto" else chart_type,
+            title=f"Harmonic Distortion Profile — {name} ({date_str})",
+            subtitle=f"Compliance Limit: {limit}% | Max Observed: {max_thd}% | Excursions: {excursions}",
+            x_axis_label="Hour of Day (IST)",
+            x_labels=x_labels,
+            y_axis_label="THD (%)",
+            threshold_line=limit,
+            threshold_label=f"IEEE 519 Limit ({limit}%)",
+            series=[ChartSeries(name=name, data=y_values, color="#D97706", unit="%")],
+            representation_reason="Line chart with limit line highlights harmonic excursions."
+        )
+        return {
+            "status": "success",
+            "metric": metric,
+            "date": date_str,
+            "limit_percent": limit,
+            "max_observed": max_thd,
+            "excursion_hours": excursions,
+            "chart_config": config.model_dump()
+        }
+
+    elif metric == "steam_flow":
+        q = """
+            SELECT formatDateTime(reading_timestamp, '%H:00') AS hour_str, AVG(toFloat64OrNull(value)) AS avg_flow
+            FROM opcda_readings
+            WHERE tag_id = {tag:String}
+              AND reading_timestamp >= parseDateTimeBestEffort({start_ts:String})
+              AND reading_timestamp <= parseDateTimeBestEffort({end_ts:String})
+              AND toFloat64OrNull(value) > 0
+            GROUP BY hour_str ORDER BY hour_str ASC;
+        """
+        rows = db_client.execute_query(q, {"tag": STEAM_FLOW_RATE_TAG, "start_ts": start_ts, "end_ts": end_ts})
+
+        x_labels = [r["hour_str"] for r in rows]
+        y_values = [round(float(r["avg_flow"]), 1) for r in rows]
+        total_flow = sum(y_values)
+
+        config = ChartConfig(
+            chart_type="area" if chart_type == "auto" else chart_type,
+            title=f"Steam Flow Rate Profile (kg/h) — {date_str}",
+            subtitle=f"Blower Room Steam | Total Flow: {total_flow:,.1f} kg",
+            x_axis_label="Hour of Day (IST)",
+            x_labels=x_labels,
+            y_axis_label="Steam Flow Rate (kg/h)",
+            series=[ChartSeries(name="Steam Flow Rate", data=y_values, color="#0891B2", unit="kg/h")],
+            representation_reason="Area chart shows thermal utility delivery volume over time."
+        )
+        return {
+            "status": "success",
+            "metric": "steam_flow",
+            "date": date_str,
+            "total_flow_kg": total_flow,
+            "chart_config": config.model_dump()
+        }
+
+    return {"error": f"Unknown metric: {metric}"}
+
+
+# ==============================================================================
+# Tool 3: Specialized Visualizations (Gauge, Scatter, Heatmap)
+# ==============================================================================
+
+@tool
+def create_specialized_chart(
+    chart_type: Literal["gauge", "scatter", "heatmap"],
+    start_date: str,
+    end_date: Optional[str] = None,
+    scatter_pair: Optional[Literal[
+        "steam_flow_vs_pressure",
+        "apparent_power_vs_pf",
+        "power_vs_current_thd"
+    ]] = None
+) -> Dict[str, Any]:
+    """
+    Generate specialized visualizations: Gauges, Scatter Plots, and Heatmaps.
+
+    CHART_TYPE OPTIONS:
+    - 'gauge': Peak Demand KPI gauge showing kVA utilization vs 1475 kVA contract (single date)
+    - 'scatter': Correlation scatter plot (requires scatter_pair param, single date)
+    - 'heatmap': 2D Hour × Date energy matrix (requires start_date AND end_date)
+
+    SCATTER_PAIR OPTIONS (for scatter):
+    - 'steam_flow_vs_pressure': Boiler steam flow vs pressure correlation
+    - 'apparent_power_vs_pf': Transformer kVA vs Power Factor
+    - 'power_vs_current_thd': Real Power kW vs Current THD %
+
+    EXAMPLES:
+    - Demand gauge: chart_type='gauge', start_date='2026-10-21'
+    - Scatter: chart_type='scatter', start_date='2026-10-21', scatter_pair='apparent_power_vs_pf'
+    - Heatmap: chart_type='heatmap', start_date='2026-10-15', end_date='2026-10-21'
+    """
+    valid, start_d, err = _validate_date(start_date)
+    if not valid:
+        return {"error": err}
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # GAUGE: Peak Demand Utilization
+    # ─────────────────────────────────────────────────────────────────────────
+    if chart_type == "gauge":
+        demand_data = facility_telemetry.get_peak_demand(start_d)
+        peak_kva = demand_data.get("peak_kva") or 0.0
+        utilization_pct = demand_data.get("utilization_percent") or 0.0
+        status = "CRITICAL" if peak_kva > PEAK_DEMAND_THRESHOLD_KVA else "NORMAL"
+
+        gauge_config = GaugeConfig(
+            current_value=peak_kva,
+            min_value=0.0,
+            max_value=CONTRACTED_DEMAND_KVA,
+            threshold_value=PEAK_DEMAND_THRESHOLD_KVA,
+            unit="kVA",
+            status=status
+        )
+
+        config = ChartConfig(
+            chart_type="gauge",
+            title=f"Peak Demand Utilization — {start_d}",
+            subtitle=f"Peak: {peak_kva:,.1f} kVA | Utilization: {utilization_pct}% | Status: {status}",
+            gauge_data=gauge_config,
+            threshold_line=PEAK_DEMAND_THRESHOLD_KVA,
+            threshold_label=f"80% Limit ({PEAK_DEMAND_THRESHOLD_KVA} kVA)",
+            representation_reason="Radial gauge provides instant executive readability for capacity headroom."
+        )
+        return {
+            "status": "success",
+            "chart_type": "gauge",
+            "date": start_d,
+            "peak_kva": peak_kva,
+            "contracted_kva": CONTRACTED_DEMAND_KVA,
+            "utilization_percent": utilization_pct,
+            "demand_status": status,
+            "chart_config": config.model_dump()
+        }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SCATTER: Correlation Plots
+    # ─────────────────────────────────────────────────────────────────────────
+    elif chart_type == "scatter":
+        if not scatter_pair:
+            return {"error": "scatter_pair is required for scatter charts. Options: steam_flow_vs_pressure, apparent_power_vs_pf, power_vs_current_thd"}
+
+        start_ts = f"{start_d} 00:00:00"
+        end_ts = f"{start_d} 23:59:59"
+
+        if scatter_pair == "steam_flow_vs_pressure":
+            q = f"""
+                SELECT
+                    toFloat64OrNull(a.value) AS flow,
+                    toFloat64OrNull(b.value) AS pressure,
+                    toString(a.reading_timestamp) AS reading_timestamp
+                FROM opcda_readings a
+                JOIN opcda_readings b ON a.reading_timestamp = b.reading_timestamp AND b.tag_id = '{STEAM_PRESSURE_TAG}'
+                WHERE a.tag_id = '{STEAM_FLOW_RATE_TAG}'
+                  AND a.reading_timestamp >= parseDateTimeBestEffort({{start_ts:String}})
+                  AND a.reading_timestamp <= parseDateTimeBestEffort({{end_ts:String}})
+                LIMIT 100;
+            """
+            rows = db_client.execute_query(q, {"start_ts": start_ts, "end_ts": end_ts})
+
+            points = [
+                ScatterPoint(x=round(float(r["flow"]), 1), y=round(float(r["pressure"]), 2), label=str(r["reading_timestamp"])[11:16])
+                for r in rows if r["flow"] and r["pressure"]
+            ]
+            scatter_series = [ScatterSeries(name="Steam Flow vs Pressure", points=points, color="#0891B2")]
+            title = f"Correlation: Steam Flow Rate vs Pressure ({start_d})"
+            x_label, y_label = "Flow Rate (kg/h)", "Pressure (bar)"
+            reason = "Scatter plot detects boiler pressure sag as a function of steam demand."
+
+        elif scatter_pair == "apparent_power_vs_pf":
+            pf_tag = "HT_Room.South_Utilities_1000kVA_Transformer/Power Factors/Power Factor Total/Power Factor Total"
+            q = f"""
+                SELECT
+                    toFloat64OrNull(a.value) AS kva,
+                    (toFloat64OrNull(b.value) / 100.0) AS pf,
+                    toString(a.reading_timestamp) AS reading_timestamp
+                FROM opcda_readings a
+                JOIN opcda_readings b ON a.reading_timestamp = b.reading_timestamp AND b.tag_id = '{pf_tag}'
+                WHERE a.tag_id = '{PEAK_DEMAND_TAG}'
+                  AND a.reading_timestamp >= parseDateTimeBestEffort({{start_ts:String}})
+                  AND a.reading_timestamp <= parseDateTimeBestEffort({{end_ts:String}})
+                LIMIT 100;
+            """
+            rows = db_client.execute_query(q, {"start_ts": start_ts, "end_ts": end_ts})
+
+            points = [
+                ScatterPoint(x=round(float(r["kva"]), 1), y=round(float(r["pf"]), 3), label=str(r["reading_timestamp"])[11:16])
+                for r in rows if r["kva"] and r["pf"]
+            ]
+            scatter_series = [ScatterSeries(name="kVA vs Power Factor", points=points, color="#2563EB")]
+            title = f"Correlation: Apparent Power vs Power Factor ({start_d})"
+            x_label, y_label = "Apparent Power (kVA)", "Power Factor (0.0 - 1.0)"
+            reason = "Pair plot identifies whether power factor degrades under high loading."
+
+        elif scatter_pair == "power_vs_current_thd":
+            real_p_tag = "HT_Room.South_Utilities_1000kVA_Transformer/Powers/Real Power/Real Power Total"
+            thd_tag = CURRENT_THD_TAGS[0]
+            q = f"""
+                SELECT
+                    toFloat64OrNull(a.value) AS kw,
+                    toFloat64OrNull(b.value) AS thd,
+                    toString(a.reading_timestamp) AS reading_timestamp
+                FROM opcda_readings a
+                JOIN opcda_readings b ON a.reading_timestamp = b.reading_timestamp AND b.tag_id = '{thd_tag}'
+                WHERE a.tag_id = '{real_p_tag}'
+                  AND a.reading_timestamp >= parseDateTimeBestEffort({{start_ts:String}})
+                  AND a.reading_timestamp <= parseDateTimeBestEffort({{end_ts:String}})
+                LIMIT 100;
+            """
+            rows = db_client.execute_query(q, {"start_ts": start_ts, "end_ts": end_ts})
+
+            points = [
+                ScatterPoint(x=round(float(r["kw"]), 1), y=round(float(r["thd"]), 2), label=str(r["reading_timestamp"])[11:16])
+                for r in rows if r["kw"] and r["thd"]
+            ]
+            scatter_series = [ScatterSeries(name="Real Power vs Current THD", points=points, color="#DC2626")]
+            title = f"Correlation: Real Power (kW) vs Current THD % ({start_d})"
+            x_label, y_label = "Real Power (kW)", "Current THD (%)"
+            reason = "Scatter plot shows whether harmonic distortion increases with load."
+
+        else:
+            return {"error": f"Unknown scatter_pair: {scatter_pair}"}
+
+        config = ChartConfig(
+            chart_type="scatter",
+            title=title,
+            x_axis_label=x_label,
+            y_axis_label=y_label,
+            scatter_series=scatter_series,
+            representation_reason=reason
+        )
+        return {
+            "status": "success",
+            "chart_type": "scatter",
+            "date": start_d,
+            "scatter_pair": scatter_pair,
+            "data_points": len(points),
+            "chart_config": config.model_dump()
+        }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # HEATMAP: Hour × Date Energy Matrix
+    # ─────────────────────────────────────────────────────────────────────────
+    elif chart_type == "heatmap":
+        if not end_date:
+            return {"error": "end_date is required for heatmap charts. Example: start_date='2026-10-15', end_date='2026-10-21'"}
+
+        valid, end_d, err = _validate_date(end_date)
+        if not valid:
+            return {"error": err}
+
+        dt_start = datetime.datetime.strptime(start_d, "%Y-%m-%d").date()
+        dt_end = datetime.datetime.strptime(end_d, "%Y-%m-%d").date()
+        days_count = (dt_end - dt_start).days + 1
+
+        dates = [(dt_start + datetime.timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days_count)]
+        hours = [f"{h:02d}:00" for h in range(24)]
+
+        # Build 2D matrix [dates][hours]
+        z_matrix = []
+        total_kwh = 0.0
+        for d in dates:
+            row = []
+            for h in range(24):
+                h_start = f"{d} {h:02d}:00:00"
+                h_end = f"{d} {h:02d}:59:59"
+                val = db_client.get_tag_delta(SHIFT_ENERGY_TAG, h_start, h_end) or 0.0
+                row.append(round(val, 1))
+                total_kwh += val
+            z_matrix.append(row)
+
+        heatmap_data = HeatmapMatrix(
+            x_labels=hours,
+            y_labels=dates,
+            z_matrix=z_matrix,
+            z_label="kWh"
+        )
+
+        config = ChartConfig(
+            chart_type="heatmap",
+            title=f"Hourly Energy Load Heatmap ({start_d} to {end_d})",
+            subtitle=f"Matrix: {len(dates)} Days × 24 Hours | Total: {total_kwh:,.1f} kWh",
+            x_axis_label="Hour of Day (IST)",
+            y_axis_label="Calendar Date",
+            heatmap_data=heatmap_data,
+            representation_reason="2D Heatmap visualizes shift-level patterns, night baseload leaks, and production clusters."
+        )
+        return {
+            "status": "success",
+            "chart_type": "heatmap",
+            "date_range": {"start": start_d, "end": end_d},
+            "days_count": days_count,
+            "total_kwh": round(total_kwh, 1),
+            "chart_config": config.model_dump()
+        }
+
+    return {"error": f"Unknown chart_type: {chart_type}"}
+
+
+# ==============================================================================
+# Tool Registry & Backward Compatibility
+# ==============================================================================
+
+from src.services.aggregation_service import aggregation_service
+from src.services.telemetry import equipments_telemetry, zones_telemetry
+
+ALL_CHART_TOOLS = [
+    create_chart,
+    create_power_quality_chart,
+    create_specialized_chart,
+]
+
 
 @tool
 def aggregate_energy_telemetry(
@@ -173,19 +751,7 @@ def aggregate_energy_telemetry(
         "treemap"
     ] = "auto"
 ) -> Dict[str, Any]:
-    """
-    Unified industrial telemetry and energy aggregation tool for Yamaha EMS.
-    Performs multi-dimensional analysis in a SINGLE call without needing multiple tool executions:
-    - 'equipment_wise': Aggregates 8 machinery categories with exclusions applied.
-    - 'zone_wise': Aggregates 17 organizational cost centers (e.g. AG Assy, AG Painting, General Admin).
-    - 'facility': Total facility grid energy trend or hourly/30-min load curve.
-    - 'specific_equipment': Pass single or array of machines (e.g. ['Compressor 1', 'Molding 1600T', 'Chiller']).
-    - 'multi_variate': Correlates Energy (kWh) with Peak Demand (kVA) and Power Factor on dual Y-axes ComposedChart.
-    - 'radar_comparison': Multi-attribute Radar/Spider diagram comparing operational shifts across 5 dimensions.
-    - 'granularity': 'daily', 'hourly', '30min' (every 30 minutes, 48 intervals), '15min' (every 15 minutes, 96 intervals).
-    Returns both the numerical telemetry dataset and the complete interactive Recharts ChartConfig.
-    """
-    from src.services.aggregation_service import aggregation_service
+    """Unified industrial telemetry and energy aggregation tool for Yamaha EMS."""
     return aggregation_service.aggregate(
         aggregation_type=aggregation_type,
         start_date=start_date,
@@ -197,387 +763,202 @@ def aggregate_energy_telemetry(
         chart_type=chart_type
     )
 
+
+# Backward-compatible tool wrappers for legacy tests and routes
+@tool
+def create_breakdown_chart(
+    date: str = "yesterday",
+    breakdown_type: Literal["equipment_wise", "zone_wise", "tariff_bands"] = "equipment_wise",
+    preferred_type: Literal["auto", "donut", "pie", "bar", "stacked_bar"] = "auto"
+) -> Dict[str, Any]:
+    """Legacy wrapper for breakdown charts."""
+    clean_date = normalize_date_str(date)
+    if breakdown_type == "equipment_wise":
+        data = equipments_telemetry.get_category_breakdown(clean_date)
+        items = data.get("categories", [])
+        title = f"Equipment-Wise Energy Breakdown ({clean_date})"
+        total_kwh = data.get("total_kwh", 0.0)
+        labels = [item["category"] for item in items]
+        values = [item["energy_kwh"] for item in items]
+    elif breakdown_type == "zone_wise":
+        data = zones_telemetry.get_zone_breakdown(clean_date)
+        items = data.get("cost_centers", [])
+        title = f"Zone-Wise Cost Center Breakdown ({clean_date})"
+        total_kwh = data.get("total_kwh", 0.0)
+        labels = [item["cost_center"] for item in items]
+        values = [item["energy_kwh"] for item in items]
+    elif breakdown_type == "tariff_bands":
+        from src.services.tariff_service import TariffService
+        tariff_data = TariffService.calculate_daily_cost(clean_date)
+        bands = tariff_data.get("band_summary", {})
+        title = f"TOD Tariff Band Energy Share ({clean_date})"
+        total_kwh = tariff_data.get("true_daily_kwh", 0.0)
+        labels = list(bands.keys())
+        values = [b["kwh"] for b in bands.values()]
+        items = [{"band": k, "kwh": v["kwh"]} for k, v in bands.items()]
+    else:
+        return {"error": f"Unknown breakdown_type: {breakdown_type}"}
+
+    if preferred_type == "auto":
+        selected_type = "donut" if len(labels) <= 8 else "bar"
+    else:
+        selected_type = preferred_type
+
+    config = ChartConfig(
+        chart_type=selected_type,
+        title=title,
+        subtitle=f"Total: {total_kwh:,.1f} kWh",
+        x_labels=labels,
+        y_axis_label="Energy (kWh)",
+        series=[ChartSeries(name="Energy", data=values, unit="kWh")],
+        center_kpi={"label": "Total", "value": f"{total_kwh:,.0f} kWh"} if selected_type in ("donut", "pie") else None,
+        representation_reason="Optimal breakdown representation."
+    )
+    result = config.model_dump()
+    result["total_kwh"] = total_kwh
+    result["categories"] = items
+    result["breakdown"] = items
+    result["chart_config"] = config.model_dump()
+    return result
+
+
 @tool
 def create_time_series_chart(
-    date: str,
-    metric: Literal["apparent_power", "hourly_kwh", "voltage_thd", "current_thd", "steam_flow"],
-    preferred_type: Literal["auto", "line", "area", "bar"] = "auto"
+    date: str = "yesterday",
+    metric: Literal["apparent_power", "hourly_kwh", "voltage_thd", "current_thd", "steam_flow"] = "hourly_kwh"
 ) -> Dict[str, Any]:
-    """
-    Generate an optimal time-series trend or hourly load curve visualization:
-    - 'apparent_power': Peak demand kVA profile with the 1180 kVA threshold line.
-    - 'hourly_kwh': Hourly consumption profile (bar or area).
-    - 'voltage_thd' / 'current_thd': Harmonic distortion curve with 5% / 8% limit lines.
-    - 'steam_flow': Blower Room steam flow rate trend (kg/h).
-    """
-    date = normalize_date_str(date)
-    if metric == "apparent_power":
-        demand_data = DemandService.get_peak_demand_analysis(date)
-        profile = demand_data.get("hourly_profile", [])
-        x_labels = [p["label"] for p in profile]
-        y_values = [p["peak_kva"] for p in profile]
-        
-        selected_type = "line" if preferred_type == "auto" else preferred_type
-        config = ChartConfig(
-            chart_type=selected_type,
-            title=f"Hourly Peak Demand Profile (kVA) - {date}",
-            subtitle=f"Contracted: {CONTRACTED_DEMAND_KVA} kVA | Peak: {demand_data.get('peak_kva')} kVA ({demand_data.get('utilization_percent')}%)",
-            x_axis_label="Hour of Day (IST)",
-            x_labels=x_labels,
-            y_axis_label="Apparent Power (kVA)",
-            threshold_line=PEAK_DEMAND_THRESHOLD_KVA,
-            threshold_label=f"80% Threshold Limit ({PEAK_DEMAND_THRESHOLD_KVA} kVA)",
-            series=[
-                ChartSeries(name="Peak Apparent Power", data=y_values, color="#2563EB", unit="kVA")
-            ],
-            representation_reason="Continuous line chart with horizontal limit line is the gold standard for tracking electrical peak demand and visual threshold crossing."
-        )
-        return config.model_dump()
+    """Legacy wrapper for create_power_quality_chart."""
+    clean_date = normalize_date_str(date)
+    if metric == "hourly_kwh":
+        res = create_chart.invoke({
+            "chart_for": "facility",
+            "start_date": clean_date,
+            "granularity": "hourly",
+            "chart_type": "bar"
+        })
+        return res.get("chart_config", res)
+    elif metric == "apparent_power":
+        res = create_power_quality_chart.invoke({
+            "start_date": clean_date,
+            "metric": "peak_demand"
+        })
+        return res.get("chart_config", res)
+    else:
+        res = create_power_quality_chart.invoke({
+            "start_date": clean_date,
+            "metric": metric
+        })
+        return res.get("chart_config", res)
 
-    elif metric == "hourly_kwh":
-        tariff_data = TariffService.calculate_daily_cost(date)
-        hourly_rows = tariff_data.get("hourly_breakdown", [])
-        x_labels = [r["hour_label"] for r in hourly_rows]
-        y_values = [r["rescaled_kwh"] for r in hourly_rows]
-        
-        selected_type = "bar" if preferred_type == "auto" else preferred_type
-        config = ChartConfig(
-            chart_type=selected_type,
-            title=f"Hourly Energy Consumption Profile (kWh) - {date}",
-            subtitle=f"Total: {tariff_data.get('true_daily_kwh'):,.1f} kWh | Rescaling factor: {tariff_data.get('rescaling_factor')}",
-            x_axis_label="Hour of Day (IST)",
-            x_labels=x_labels,
-            y_axis_label="Electricity Consumption (kWh)",
-            series=[
-                ChartSeries(name="Hourly Energy", data=y_values, color="#059669", unit="kWh")
-            ],
-            representation_reason="Bar chart best represents discrete hourly energy buckets across the 24-hour day-night cycle."
-        )
-        return config.model_dump()
-
-    elif metric in ("voltage_thd", "current_thd"):
-        # Query hourly THD averages
-        is_voltage = (metric == "voltage_thd")
-        tag = VOLTAGE_THD_TAGS[3] if is_voltage else CURRENT_THD_TAGS[0]
-        limit = 5.0 if is_voltage else 8.0
-        unit = "%"
-        
-        q = f"""
-            SELECT SUBSTR(reading_timestamp, 12, 2) || ':00' AS hour_str, AVG(value) AS avg_thd
-            FROM opcda_readings
-            WHERE tag_id = ? AND reading_timestamp >= ? AND reading_timestamp <= ? AND value > 0
-            GROUP BY hour_str
-            ORDER BY hour_str ASC;
-        """
-        rows = db_client.execute_query(q, (tag, f"{date} 00:00:00", f"{date} 23:59:59"))
-        x_labels = [r["hour_str"] for r in rows]
-        y_values = [round(float(r["avg_thd"]), 2) for r in rows]
-
-        name = "Voltage THD (L-N)" if is_voltage else "Current THD (Phase A)"
-        config = ChartConfig(
-            chart_type="line" if preferred_type == "auto" else preferred_type,
-            title=f"Harmonic Distortion Profile - {name} ({date})",
-            subtitle=f"Compliance Limit: {limit}%",
-            x_axis_label="Hour of Day (IST)",
-            x_labels=x_labels,
-            y_axis_label="THD (%)",
-            threshold_line=limit,
-            threshold_label=f"IEEE 519 / Yamaha Limit ({limit}%)",
-            series=[
-                ChartSeries(name=name, data=y_values, color="#D97706", unit="%")
-            ],
-            representation_reason="Line chart with regulatory limit line clearly highlights harmonic distortion excursions."
-        )
-        return config.model_dump()
-
-    elif metric == "steam_flow":
-        q = """
-            SELECT SUBSTR(reading_timestamp, 12, 2) || ':00' AS hour_str, AVG(value) AS avg_flow
-            FROM opcda_readings
-            WHERE tag_id = ? AND reading_timestamp >= ? AND reading_timestamp <= ? AND value > 0
-            GROUP BY hour_str
-            ORDER BY hour_str ASC;
-        """
-        rows = db_client.execute_query(q, (STEAM_FLOW_RATE_TAG, f"{date} 00:00:00", f"{date} 23:59:59"))
-        x_labels = [r["hour_str"] for r in rows]
-        y_values = [round(float(r["avg_flow"]), 1) for r in rows]
-
-        config = ChartConfig(
-            chart_type="area" if preferred_type == "auto" else preferred_type,
-            title=f"Steam Flow Rate Profile (kg/h) - {date}",
-            subtitle="Flowmeter-Gate1.Blower_Room_Steam",
-            x_axis_label="Hour of Day (IST)",
-            x_labels=x_labels,
-            y_axis_label="Steam Flow Rate (kg/h)",
-            series=[
-                ChartSeries(name="Steam Flow Rate", data=y_values, color="#0891B2", unit="kg/h")
-            ],
-            representation_reason="Area chart conveys thermal utility delivery volume smoothly over time."
-        )
-        return config.model_dump()
-
-    return {"error": f"Unsupported metric: {metric}"}
 
 @tool
 def create_shift_comparison_chart(
-    start_date: str,
-    end_date: Optional[str] = None,
-    preferred_type: Literal["auto", "stacked_bar", "grouped_bar", "donut"] = "auto"
+    start_date: str = "yesterday",
+    end_date: Optional[str] = None
 ) -> Dict[str, Any]:
-    """
-    Generate a shift comparison visualization across shifts A, B, and C:
-    - Single day: Donut or Grouped Bar comparing Shift A (08-17), Shift B (17-00:40), Shift C (00:40-08).
-    - Multi-day: Stacked Bar showing daily total height while visualizing Shift A, B, C contributions.
-    """
-    start_date = normalize_date_str(start_date)
-    if end_date:
-        end_date = normalize_date_str(end_date)
-    if not end_date or end_date == start_date:
-        # Single day
-        shift_data = ShiftService.get_shift_consumption(start_date)
-        a_kwh = shift_data.get("shift_a_kwh") or 0.0
-        b_kwh = shift_data.get("shift_b_kwh") or 0.0
-        c_kwh = shift_data.get("shift_c_kwh") or 0.0
-        total = round(a_kwh + b_kwh + c_kwh, 1)
+    """Legacy wrapper for shift comparison."""
+    start_d = normalize_date_str(start_date)
+    end_d = normalize_date_str(end_date) if end_date else None
 
-        selected_type = "donut" if preferred_type in ("auto", "donut") else preferred_type
-        labels = ["Shift A (08:00-17:00)", "Shift B (17:00-00:40)", "Shift C (00:40-08:00)"]
-        values = [a_kwh, b_kwh, c_kwh]
-
+    if not end_d or start_d == end_d:
+        data = facility_telemetry.get_grid_shift_energy(start_d)
+        shifts = data.get("shifts", {})
+        labels = ["Shift A (Day)", "Shift B (Evening)", "Shift C (Night)"]
+        values = [
+            shifts.get("Shift A", {}).get("energy_kwh", 0.0),
+            shifts.get("Shift B", {}).get("energy_kwh", 0.0),
+            shifts.get("Shift C", {}).get("energy_kwh", 0.0)
+        ]
+        total = data.get("total_shifts_kwh", sum(values))
         config = ChartConfig(
-            chart_type=selected_type,
-            title=f"Shift-Wise Energy Distribution ({start_date})",
-            subtitle=f"Total Across Shifts: {total:,.1f} kWh",
-            x_axis_label="Industrial Shift",
+            chart_type="donut",
+            title=f"Shift-Wise Energy Distribution ({start_d})",
+            subtitle=f"Total: {total:,.1f} kWh",
             x_labels=labels,
             y_axis_label="Energy (kWh)",
-            series=[
-                ChartSeries(name="Shift kWh", data=values, unit="kWh")
-            ],
-            center_kpi={"label": "Shift Total", "value": f"{total:,.1f} kWh"},
-            representation_reason="Donut chart immediately displays the proportion of energy consumed across Day (A), Evening (B), and Night (C) shifts."
+            series=[ChartSeries(name="Shift Energy", data=values, unit="kWh")],
+            center_kpi={"label": "Total", "value": f"{total:,.0f} kWh"},
+            representation_reason="Donut chart clearly shows relative contribution of 3 operational shifts."
         )
         return config.model_dump()
     else:
-        # Multi-day range: Stacked Bar is the best representation!
-        dt_start = datetime.datetime.strptime(start_date, "%Y-%m-%d").date()
-        dt_end = datetime.datetime.strptime(end_date, "%Y-%m-%d").date()
+        dt_start = datetime.datetime.strptime(start_d, "%Y-%m-%d").date()
+        dt_end = datetime.datetime.strptime(end_d, "%Y-%m-%d").date()
         days_count = (dt_end - dt_start).days + 1
-
         dates = [(dt_start + datetime.timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days_count)]
-        shift_a_vals = []
-        shift_b_vals = []
-        shift_c_vals = []
-
+        shift_a, shift_b, shift_c = [], [], []
         for d in dates:
-            s_data = ShiftService.get_shift_consumption(d)
-            shift_a_vals.append(s_data.get("shift_a_kwh") or 0.0)
-            shift_b_vals.append(s_data.get("shift_b_kwh") or 0.0)
-            shift_c_vals.append(s_data.get("shift_c_kwh") or 0.0)
-
-        selected_type = "stacked_bar" if preferred_type == "auto" else preferred_type
+            data = facility_telemetry.get_grid_shift_energy(d)
+            shifts = data.get("shifts", {})
+            shift_a.append(shifts.get("Shift A", {}).get("energy_kwh", 0.0))
+            shift_b.append(shifts.get("Shift B", {}).get("energy_kwh", 0.0))
+            shift_c.append(shifts.get("Shift C", {}).get("energy_kwh", 0.0))
+        series = [
+            ChartSeries(name="Shift A (Day)", data=shift_a, color="#2563EB", unit="kWh"),
+            ChartSeries(name="Shift B (Evening)", data=shift_b, color="#059669", unit="kWh"),
+            ChartSeries(name="Shift C (Night)", data=shift_c, color="#D97706", unit="kWh")
+        ]
         config = ChartConfig(
-            chart_type=selected_type,
-            title=f"Multi-Day Shift Breakdown ({start_date} to {end_date})",
-            subtitle=f"Total {days_count} Days Tracked",
-            x_axis_label="Calendar Date (IST)",
+            chart_type="stacked_bar",
+            title=f"Shift Energy Comparison ({start_d} to {end_d})",
+            subtitle=f"Multi-Day Comparison across 3 Shifts",
+            x_axis_label="Calendar Date",
             x_labels=dates,
-            y_axis_label="Energy Consumption (kWh)",
-            series=[
-                ChartSeries(name="Shift A (Day)", data=shift_a_vals, color="#2563EB", unit="kWh"),
-                ChartSeries(name="Shift B (Evening)", data=shift_b_vals, color="#D97706", unit="kWh"),
-                ChartSeries(name="Shift C (Night)", data=shift_c_vals, color="#7C3AED", unit="kWh"),
-            ],
-            representation_reason="Stacked bar chart is the optimal visualization for multi-day shift comparisons because bar height reveals the total daily load while internal segments reveal shift composition."
+            y_axis_label="Energy (kWh)",
+            series=series,
+            representation_reason="Stacked bar chart enables direct comparison of shift-by-shift totals over consecutive production dates."
         )
         return config.model_dump()
 
+
 @tool
-def create_demand_utilization_gauge(date: str) -> Dict[str, Any]:
-    """
-    Generate an executive KPI Gauge/Radial meter showing peak apparent power (kVA)
-    against the 1475.0 kVA Contracted Demand limit and 1180.0 kVA (80%) threshold.
-    """
-    date = normalize_date_str(date)
-    demand_data = DemandService.get_peak_demand_analysis(date)
-    peak_kva = demand_data.get("peak_kva") or 0.0
-    utilization_pct = demand_data.get("utilization_percent") or 0.0
-    status = "CRITICAL" if peak_kva > PEAK_DEMAND_THRESHOLD_KVA else "NORMAL"
+def create_demand_utilization_gauge(date: str = "yesterday") -> Dict[str, Any]:
+    """Legacy wrapper for peak demand gauge."""
+    res = create_specialized_chart.invoke({
+        "chart_type": "gauge",
+        "start_date": date
+    })
+    return res.get("chart_config", res)
 
-    gauge_config = GaugeConfig(
-        current_value=peak_kva,
-        min_value=0.0,
-        max_value=CONTRACTED_DEMAND_KVA,
-        threshold_value=PEAK_DEMAND_THRESHOLD_KVA,
-        unit="kVA",
-        status=status
-    )
-
-    config = ChartConfig(
-        chart_type="gauge",
-        title=f"Peak Demand Utilization Gauge ({date})",
-        subtitle=f"Peak: {peak_kva:,.1f} kVA | Utilization: {utilization_pct}% | Status: {status}",
-        gauge_data=gauge_config,
-        threshold_line=PEAK_DEMAND_THRESHOLD_KVA,
-        threshold_label="80% Contract Limit (1180 kVA)",
-        representation_reason="Radial Gauge provides instant executive readability for capacity headroom and threshold compliance."
-    )
-    return config.model_dump()
 
 @tool
 def create_correlation_scatter_plot(
-    date: str,
-    pair_type: Literal["steam_flow_vs_pressure", "apparent_power_vs_pf", "power_vs_current_thd"]
+    date: str = "yesterday",
+    pair_type: Literal["steam_flow_vs_pressure", "apparent_power_vs_pf", "power_vs_current_thd"] = "steam_flow_vs_pressure"
 ) -> Dict[str, Any]:
-    """
-    Generate a Scatter Plot / Pair Plot to analyze physical and electrical correlations:
-    - 'steam_flow_vs_pressure': Boiler pressure stability vs steam consumption surge.
-    - 'apparent_power_vs_pf': Transformer loading (kVA) vs Power Factor degradation.
-    - 'power_vs_current_thd': Real load (kW) vs Harmonic current distortion (%).
-    """
-    date = normalize_date_str(date)
-    start_ts = f"{date} 00:00:00"
-    end_ts = f"{date} 23:59:59"
+    """Legacy wrapper for correlation scatter plots."""
+    res = create_specialized_chart.invoke({
+        "chart_type": "scatter",
+        "start_date": date,
+        "scatter_pair": pair_type
+    })
+    return res.get("chart_config", res)
 
-    if pair_type == "steam_flow_vs_pressure":
-        q = f"""
-            SELECT a.value AS flow, b.value AS pressure, a.reading_timestamp
-            FROM opcda_readings a
-            JOIN opcda_readings b ON a.reading_timestamp = b.reading_timestamp AND b.tag_id = '{STEAM_PRESSURE_TAG}'
-            WHERE a.tag_id = '{STEAM_FLOW_RATE_TAG}' AND a.reading_timestamp >= ? AND a.reading_timestamp <= ?
-            LIMIT 100;
-        """
-        rows = db_client.execute_query(q, (start_ts, end_ts))
-        points = [
-            ScatterPoint(
-                x=round(float(r["flow"]), 1),
-                y=round(float(r["pressure"]), 2),
-                label=r["reading_timestamp"][11:16]
-            )
-            for r in rows
-        ]
-        scatter_series = [ScatterSeries(name="Steam Flow vs Pressure", points=points, color="#0891B2")]
-        title = f"Correlation: Steam Flow Rate vs Pressure ({date})"
-        x_label = "Flow Rate (kg/h)"
-        y_label = "Pressure (bar)"
-        reason = "Scatter plot detects boiler pressure sag as a function of instantaneous steam demand."
-
-    elif pair_type == "apparent_power_vs_pf":
-        pf_tag = f"HT_Room.South_Utilities_1000kVA_Transformer/Power Factors/Power Factor Total/Power Factor Total"
-        q = f"""
-            SELECT a.value AS kva, (b.value / 100.0) AS pf, a.reading_timestamp
-            FROM opcda_readings a
-            JOIN opcda_readings b ON a.reading_timestamp = b.reading_timestamp AND b.tag_id = '{pf_tag}'
-            WHERE a.tag_id = '{PEAK_DEMAND_TAG}' AND a.reading_timestamp >= ? AND a.reading_timestamp <= ?
-            LIMIT 100;
-        """
-        rows = db_client.execute_query(q, (start_ts, end_ts))
-        points = [
-            ScatterPoint(
-                x=round(float(r["kva"]), 1),
-                y=round(float(r["pf"]), 3),
-                label=r["reading_timestamp"][11:16]
-            )
-            for r in rows
-        ]
-        scatter_series = [ScatterSeries(name="kVA vs Power Factor", points=points, color="#2563EB")]
-        title = f"Correlation: Apparent Power vs Power Factor ({date})"
-        x_label = "Apparent Power (kVA)"
-        y_label = "Power Factor (0.0 - 1.0)"
-        reason = "Pair plot identifies whether transformer power factor degrades under high loading."
-
-    elif pair_type == "power_vs_current_thd":
-        real_p_tag = "HT_Room.South_Utilities_1000kVA_Transformer/Powers/Real Power/Real Power Total"
-        thd_tag = CURRENT_THD_TAGS[0]
-        q = f"""
-            SELECT a.value AS kw, b.value AS thd, a.reading_timestamp
-            FROM opcda_readings a
-            JOIN opcda_readings b ON a.reading_timestamp = b.reading_timestamp AND b.tag_id = '{thd_tag}'
-            WHERE a.tag_id = '{real_p_tag}' AND a.reading_timestamp >= ? AND a.reading_timestamp <= ?
-            LIMIT 100;
-        """
-        rows = db_client.execute_query(q, (start_ts, end_ts))
-        points = [
-            ScatterPoint(
-                x=round(float(r["kw"]), 1),
-                y=round(float(r["thd"]), 2),
-                label=r["reading_timestamp"][11:16]
-            )
-            for r in rows
-        ]
-        scatter_series = [ScatterSeries(name="Real Power vs Current THD", points=points, color="#DC2626")]
-        title = f"Correlation: Real Power (kW) vs Current THD % ({date})"
-        x_label = "Real Power (kW)"
-        y_label = "Current THD (%)"
-        reason = "Scatter plot proves whether non-linear harmonic distortion increases proportionally with factory load."
-
-    else:
-        return {"error": f"Unknown pair_type: {pair_type}"}
-
-    config = ChartConfig(
-        chart_type="scatter",
-        title=title,
-        x_axis_label=x_label,
-        y_axis_label=y_label,
-        scatter_series=scatter_series,
-        representation_reason=reason
-    )
-    return config.model_dump()
 
 @tool
 def create_load_heatmap(
-    start_date: str,
-    end_date: str
+    start_date: str = "yesterday",
+    end_date: Optional[str] = None
 ) -> Dict[str, Any]:
-    """
-    Generate a 2D Heatmap Matrix showing energy consumption intensity across
-    Hour of Day (00:00 to 23:00) vs Calendar Dates/Days.
-    Best visual representation for discovering operational load patterns, vampire loads, and shift anomalies.
-    """
-    start_date = normalize_date_str(start_date)
-    end_date = normalize_date_str(end_date)
-    dt_start = datetime.datetime.strptime(start_date, "%Y-%m-%d").date()
-    dt_end = datetime.datetime.strptime(end_date, "%Y-%m-%d").date()
-    days_count = (dt_end - dt_start).days + 1
+    """Legacy wrapper for load heatmap."""
+    res = create_specialized_chart.invoke({
+        "chart_type": "heatmap",
+        "start_date": start_date,
+        "end_date": end_date
+    })
+    return res.get("chart_config", res)
 
-    dates = [(dt_start + datetime.timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days_count)]
-    hours = [f"{h:02d}:00" for h in range(24)]
 
-    # Build 2D matrix [dates][hours]
-    z_matrix = []
-    for d in dates:
-        row = []
-        for h in range(24):
-            start_ts = f"{d} {h:02d}:00:00"
-            end_ts = f"{d} {h:02d}:59:59"
-            val = db_client.get_tag_delta(SHIFT_ENERGY_TAG, start_ts, end_ts) or 0.0
-            row.append(round(val, 1))
-        z_matrix.append(row)
-
-    heatmap_data = HeatmapMatrix(
-        x_labels=hours,
-        y_labels=dates,
-        z_matrix=z_matrix,
-        z_label="kWh"
-    )
-
-    config = ChartConfig(
-        chart_type="heatmap",
-        title=f"Hourly Energy Load Heatmap ({start_date} to {end_date})",
-        subtitle=f"Matrix: {len(dates)} Days × 24 Hours (IST)",
-        x_axis_label="Hour of Day (IST)",
-        y_axis_label="Calendar Date",
-        heatmap_data=heatmap_data,
-        representation_reason="2D Heatmap instantly visualizes shift-level energy patterns, night baseload leaks, and high-intensity production clusters."
-    )
-    return config.model_dump()
-
-ALL_CHART_TOOLS = [
-    aggregate_energy_telemetry,
-    create_breakdown_chart,
-    create_time_series_chart,
-    create_shift_comparison_chart,
-    create_demand_utilization_gauge,
-    create_correlation_scatter_plot,
-    create_load_heatmap,
+__all__ = [
+    "create_chart",
+    "create_power_quality_chart",
+    "create_specialized_chart",
+    "create_breakdown_chart",
+    "create_time_series_chart",
+    "create_shift_comparison_chart",
+    "create_demand_utilization_gauge",
+    "create_correlation_scatter_plot",
+    "create_load_heatmap",
+    "aggregate_energy_telemetry",
+    "ALL_CHART_TOOLS",
 ]

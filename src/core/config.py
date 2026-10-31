@@ -13,15 +13,24 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = Field(default="development")
     LOG_LEVEL: str = Field(default="INFO")
 
-    # Database
-    DB_TYPE: str = Field(default="sqlite")  # 'sqlite' or 'clickhouse'
-    SQLITE_DB_PATH: str = Field(default="yamaha_mock.db")
-
+    # Database - ClickHouse (Telemetry)
     CLICKHOUSE_HOST: str = Field(default="localhost")
     CLICKHOUSE_PORT: int = Field(default=8123)
     CLICKHOUSE_DATABASE: str = Field(default="yamaha")
     CLICKHOUSE_USER: str = Field(default="default")
     CLICKHOUSE_PASSWORD: str = Field(default="")
+
+    # Database - PostgreSQL (Chat Management)
+    POSTGRES_HOST: str = Field(default="localhost")
+    POSTGRES_PORT: int = Field(default=5432)
+    POSTGRES_DATABASE: str = Field(default="yamaha")
+    POSTGRES_USER: str = Field(default="chat_app_user")
+    POSTGRES_PASSWORD: str = Field(default="")
+
+    # JWT Authentication
+    JWT_SECRET_KEY: str = Field(default="yamaha-energy-assistant-dev-secret-key-2024")
+    JWT_ALGORITHM: str = Field(default="HS256")
+    JWT_EXPIRY_DAYS: int = Field(default=365)  # Long expiry for development
 
     # LLM Settings (AWS Bedrock / Qwen / OpenAI compatible)
     LLM_PROVIDER: str = Field(default="bedrock")  # 'bedrock', 'openai', 'qwen'

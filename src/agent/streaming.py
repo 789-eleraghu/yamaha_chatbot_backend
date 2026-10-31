@@ -1,6 +1,7 @@
 """
 Streaming Protocol Engine for assistant-ui & Vercel AI SDK
 Streams genuine tokens and tool lifecycle events directly from LangGraph.
+Integrates NeMo-style guardrails for input/output filtering.
 """
 
 import asyncio
@@ -15,6 +16,8 @@ from src.agent.response_formatter import response_formatter
 from src.core.config import settings
 from src.schemas.chat import AssistantResponse
 from src.services.chat_service import chat_service
+from src.guardrails import guardrails_service, GuardrailsResult
+from src.guardrails.guardrails_service import RailType
 
 SSE_HEADERS = {
     "Content-Type": "text/event-stream",
@@ -55,7 +58,9 @@ class StreamingEngine:
         chat_id: str,
         user_msg_id: int,
         convo_history: Optional[List[BaseMessage]] = None,
-        model_name: str = "qwen.qwen3-vl-235b-a22b"
+        model_name: str = "qwen.qwen3-vl-235b-a22b",
+        chat_title: Optional[str] = None,
+        **kwargs
     ) -> AsyncGenerator[str, None]:
         text_id = f"text_{int(datetime.datetime.now().timestamp() * 1000)}"
         text_started = False
@@ -64,6 +69,40 @@ class StreamingEngine:
         functional_tools: List[Dict[str, Any]] = []
         last_structured_response: Optional[AssistantResponse] = None
         chart_config = None
+
+        # Chat title is saved in DB and returned in HTTP headers (X-Chat-Title).
+        # Avoid emitting non-standard chunks into the x-vercel-ai-ui-message-stream.
+
+        # ====================================================================
+        # INPUT GUARDRAILS CHECK (Jailbreak, Topic)
+        # Runs BEFORE LangGraph execution - blocks with fixed response if needed
+        # ====================================================================
+        rail_result = await guardrails_service.check_input_async(prompt, convo_history=convo_history)
+
+        if not rail_result.passed:
+            # Guardrail blocked - return fixed response without LLM
+            blocked_response = rail_result.response or "I can only help with Yamaha plant energy analysis."
+
+            yield f"data: {json.dumps({'type': 'text-start', 'id': text_id})}\n\n"
+            yield f"data: {json.dumps({'type': 'text-delta', 'id': text_id, 'delta': blocked_response})}\n\n"
+            yield f"data: {json.dumps({'type': 'text-end', 'id': text_id})}\n\n"
+
+            # Save blocked response to chat history
+            meta = {
+                "guardrail_blocked": True,
+                "rail_type": rail_result.rail_type.value,
+                "should_log": rail_result.should_log
+            }
+            await chat_service.save_assistant_turn_async(
+                chat_id=chat_id,
+                content=blocked_response,
+                model_name=model_name,
+                metadata=meta,
+                user_msg_id=user_msg_id
+            )
+
+            yield "data: [DONE]\n\n"
+            return
 
         try:
             # Prepare state with full multi-turn conversation context
@@ -88,6 +127,9 @@ class StreamingEngine:
             graph = get_agent_graph()
             tracer = LangChainTracer(project_name=settings.LANGCHAIN_PROJECT)
 
+            # Track tool call IDs to ensure input/output events match
+            tool_call_id_map: Dict[str, str] = {}
+
             # Stream real-time events from LangGraph execution
             async for event in graph.astream_events(initial_state, version="v2", config={"callbacks": [tracer]}):
                 kind = event["event"]
@@ -105,7 +147,7 @@ class StreamingEngine:
                         structured = output.get("structured_response")
                         last_structured_response = structured
                         ans_text = structured.answer_markdown if structured else "Analysis completed."
-                        
+
                         yield f"data: {json.dumps({'type': 'text-start', 'id': text_id})}\n\n"
                         text_started = True
                         yield f"data: {json.dumps({'type': 'text-delta', 'id': text_id, 'delta': ans_text})}\n\n"
@@ -117,22 +159,49 @@ class StreamingEngine:
                 elif kind == "on_tool_start":
                     t_name = event.get("name", "tool")
                     t_input = event.get("data", {}).get("input", {})
-                    run_id = event.get("run_id") or f"call_{int(datetime.datetime.now().timestamp() * 1000)}"
-                    yield f"data: {json.dumps({'type': 'tool-input-available', 'toolCallId': run_id, 'toolName': t_name, 'input': t_input})}\n\n"
+                    langgraph_run_id = event.get("run_id", "")
+
+                    # Generate stable tool call ID and store mapping
+                    tool_call_id = f"call_{t_name}_{int(datetime.datetime.now().timestamp() * 1000)}"
+                    if langgraph_run_id:
+                        tool_call_id_map[langgraph_run_id] = tool_call_id
+
+                    yield f"data: {json.dumps({'type': 'tool-input-available', 'toolCallId': tool_call_id, 'toolName': t_name, 'input': t_input})}\n\n"
 
                 # 3. Tool Execution End Event
                 elif kind == "on_tool_end":
                     t_name = event.get("name", "tool")
-                    t_output = event.get("data", {}).get("output", {})
-                    run_id = event.get("run_id") or f"call_{int(datetime.datetime.now().timestamp() * 1000)}"
-                    fmt_output = t_output if isinstance(t_output, (dict, str, list)) else str(t_output)
-                    yield f"data: {json.dumps({'type': 'tool-output-available', 'toolCallId': run_id, 'output': fmt_output})}\n\n"
-                    
+                    t_output_raw = event.get("data", {}).get("output", {})
+                    langgraph_run_id = event.get("run_id", "")
+
+                    # Look up the matching tool call ID from on_tool_start
+                    tool_call_id = tool_call_id_map.get(langgraph_run_id, f"call_{t_name}_{int(datetime.datetime.now().timestamp() * 1000)}")
+
+                    # Extract content from ToolMessage if needed (LangGraph ToolNode returns ToolMessage)
+                    if hasattr(t_output_raw, "content"):
+                        # It's a ToolMessage - extract and parse its content
+                        content = t_output_raw.content
+                        try:
+                            fmt_output = json.loads(content) if isinstance(content, str) else content
+                        except (json.JSONDecodeError, TypeError):
+                            fmt_output = content
+                    elif isinstance(t_output_raw, (dict, list)):
+                        fmt_output = t_output_raw
+                    elif isinstance(t_output_raw, str):
+                        try:
+                            fmt_output = json.loads(t_output_raw)
+                        except (json.JSONDecodeError, TypeError):
+                            fmt_output = t_output_raw
+                    else:
+                        fmt_output = str(t_output_raw)
+
+                    yield f"data: {json.dumps({'type': 'tool-output-available', 'toolCallId': tool_call_id, 'output': fmt_output})}\n\n"
+
                     functional_tools.append({
                         "name": t_name,
                         "input": event.get("data", {}).get("input", {}),
                         "output": fmt_output,
-                        "call_id": run_id
+                        "call_id": tool_call_id
                     })
                     # Asynchronously persist tool turn (non-blocking)
                     await chat_service.save_tool_turn_async(
@@ -140,7 +209,7 @@ class StreamingEngine:
                         tool_name=t_name,
                         tool_input=event.get("data", {}).get("input", {}),
                         tool_output=fmt_output,
-                        tool_call_id=run_id,
+                        tool_call_id=tool_call_id,
                         user_msg_id=user_msg_id
                     )
 
@@ -175,10 +244,20 @@ class StreamingEngine:
 
             if chart_config:
                 has_chart_event = any(t.get("name") in (
-                    "aggregate_energy_telemetry",
-                    "create_breakdown_chart", "create_time_series_chart",
-                    "create_demand_utilization_gauge", "create_load_heatmap",
-                    "create_shift_comparison_chart", "create_correlation_scatter_plot"
+                    "create_visualization",
+                    "create_chart",
+                    "create_breakdown_chart",
+                    "create_time_series_chart",
+                    "create_demand_utilization_gauge",
+                    "create_gauge_chart",
+                    "create_load_heatmap",
+                    "create_heatmap_chart",
+                    "create_shift_comparison_chart",
+                    "create_correlation_scatter_plot",
+                    "create_power_quality_chart",
+                    "create_specialized_chart",
+                    "create_comparison_chart",
+                    "aggregate_energy_telemetry"
                 ) for t in functional_tools)
 
                 if not has_chart_event:
@@ -225,13 +304,25 @@ class StreamingEngine:
                 yield f"data: {json.dumps({'type': 'text-end', 'id': text_id})}\n\n"
                 text_ended = True
 
-            # Save assistant turn to database asynchronously
+            # ================================================================
+            # OUTPUT GUARDRAILS CHECK (Prompt Leak Detection)
+            # Runs AFTER LLM generation - blocks if response contains leaks
+            # ================================================================
             full_response_text = "".join(accumulated_tokens)
+
+            output_rail = await guardrails_service.check_output_async(full_response_text)
+            if not output_rail.passed:
+                # Output blocked - this is rare but possible
+                # In streaming, we can't unsend tokens, but we log and replace for persistence
+                full_response_text = output_rail.response or "Analysis completed."
+
+            # Save assistant turn to database asynchronously
             meta = {
                 "key_metrics": getattr(last_structured_response, "key_metrics", {}) if last_structured_response else {},
                 "chart": chart_config,
                 "data_quality_notes": getattr(last_structured_response, "data_quality_notes", None) if last_structured_response else None,
-                "tools_used": [t.get("name") for t in functional_tools]
+                "tools_used": [t.get("name") for t in functional_tools],
+                "output_rail_blocked": not output_rail.passed
             }
             await chat_service.save_assistant_turn_async(
                 chat_id=chat_id,

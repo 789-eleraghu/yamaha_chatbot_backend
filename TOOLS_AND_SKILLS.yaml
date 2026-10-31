@@ -1,0 +1,1157 @@
+# ==============================================================================
+# Yamaha Industrial Energy Management AI Assistant
+# Skills, Tools, Capabilities & Location Catalog
+# ==============================================================================
+
+metadata:
+  title: "Yamaha EMS Assistant — Skills & Tools Registry"
+  version: "1.0.0"
+  last_updated: "2026-10-22"
+  environment: "Production / Development"
+  status: "Active"
+  description: >
+    Authoritative catalog of all AI agent Skills and Tools in the Yamaha Industrial
+    Energy Management System (EMS). Details operational capabilities, parameters,
+    source code locations, backing deterministic services, and frontend UI mappings.
+
+# ------------------------------------------------------------------------------
+# 1. Architecture: Skills vs. Tools
+# ------------------------------------------------------------------------------
+architecture:
+  concepts:
+    skills:
+      definition: >
+        High-level, intelligent capabilities that orchestrate multi-step intent
+        resolution, data aggregation, chart type selection, and response formatting.
+        Skills act as single entry points that prevent LLM tool selection confusion
+        and handle compound user requests (e.g., "stacked bar AND line chart").
+      primary_skill: "visualization_skill"
+      location: "yamaha_chatbot_backend/src/skills/"
+    tools:
+      definition: >
+        Deterministic, single-purpose functions decorated with LangChain's @tool.
+        They wrap backend business services, execute authoritative ClickHouse/SQLite
+        queries, enforce industrial calculations (e.g., Section 9 shift boundary rules,
+        true daily counter scaling), and return typed JSON payloads.
+      location: "yamaha_chatbot_backend/src/tools/"
+
+  execution_pipeline:
+    1_input_guardrail: "NeMo Guardrails validates prompt safety, prompt leak checks, and topicality (with conversation history)."
+    2_fast_path: "Trivial queries (greetings, capabilities) return instantly without LLM reasoning or tool calls."
+    3_agent_reasoning: "Bedrock Qwen-2.5-72B / LangGraph agent inspects available tools and decides invocation plan."
+    4_skill_or_tool_exec: "Tool executes deterministic business logic against ClickHouse (392M OPC-DA readings) or SQLite."
+    5_sse_streaming: "FastAPI streams tool execution lifecycle and assistant tokens via SSE to Express bridge and React UI."
+    6_frontend_render: "assistant-ui intercepts registered tool names and renders interactive cards or Recharts SVG visuals."
+
+# ------------------------------------------------------------------------------
+# 2. Runtime Configuration & Tool Modes
+# ------------------------------------------------------------------------------
+runtime_configuration:
+  env_flag: "USE_UNIFIED_VISUALIZATION"
+  default: true
+  description: >
+    Controls whether the AI agent is initialized with the unified visualization skill
+    or the legacy individual chart tools.
+  modes:
+    unified_mode:
+      active: true
+      total_tools: 24
+      composition:
+        skills: 1               # create_visualization (backed by VisualizationSkill)
+        ems_telemetry_tools: 15 # Authoritative energy and plant diagnostic tools (including solar & power factor)
+        utility_tools: 6        # Date/time, shift boundary, file, and tag catalog tools
+        specialized_charts: 2   # create_demand_utilization_gauge, create_correlation_scatter_plot
+      advantage: "Eliminates LLM confusion between overlapping chart tools and guarantees correct chart selection."
+    legacy_mode:
+      active: false
+      total_tools: 28
+      composition:
+        skills: 0
+        ems_telemetry_tools: 15
+        utility_tools: 6
+        legacy_chart_tools: 7   # aggregate_energy_telemetry, create_breakdown_chart, etc.
+
+# ==============================================================================
+# 3. Skills Catalog
+# ==============================================================================
+skills:
+  - id: "visualization_skill"
+    name: "Unified Visualization Skill"
+    class_name: "VisualizationSkill"
+    singleton_instance: "visualization_skill"
+    location: "yamaha_chatbot_backend/src/skills/visualization_skill.py"
+    line_number: 86
+    exposed_tool: "create_visualization"
+    capability: >
+      End-to-end visualization generation. Ingests natural language visualization
+      prompts, automatically detects user intent (equipment, zone, solar, shift, tariff,
+      gauge, heatmap, correlation), chooses optimal chart types (or synthesizes multiple
+      charts when requested like 'stacked bar AND line chart'), resolves date ranges,
+      queries the AggregationService, and returns formatted chart configurations.
+    supported_intents:
+      - "equipment_comparison: 8 equipment categories across single or multiple days"
+      - "zone_comparison: 17 plant cost centers across single or multiple days"
+      - "time_series: Facility load curve (hourly or daily) on Main Incomer"
+      - "solar: 24-hour rooftop 100kW solar generation profile or multi-day trend"
+      - "shift_breakdown: Shift A, B, and C energy share and comparisons"
+      - "tariff_breakdown: HT_1 TOD tariff band distribution (Off-Peak, Normal, Peak)"
+      - "demand_gauge: Contracted kVA demand utilization vs 1475 kVA limit"
+      - "correlation: Scatter plots (Steam Flow vs Pressure, kW vs THD, kVA vs PF)"
+      - "heatmap: 24h x N days facility load density matrix"
+    supported_chart_types:
+      - "auto"
+      - "bar"
+      - "grouped_bar"
+      - "stacked_bar"
+      - "horizontal_bar"
+      - "line"
+      - "area"
+      - "stacked_area"
+      - "donut"
+      - "pie"
+      - "radar"
+      - "radial_bar"
+      - "composed"
+      - "scatter"
+      - "heatmap"
+      - "treemap"
+      - "gauge"
+    multi_chart_support: true
+    parameters:
+      - name: "description"
+        type: "string"
+        required: true
+        description: "Natural language description of desired visualization (e.g., 'stacked bar AND line chart for zones', 'solar generation hourly profile')."
+      - name: "start_date"
+        type: "string"
+        required: false
+        default: "yesterday"
+        description: "Start date (YYYY-MM-DD or relative like 'yesterday', 'today', 'last_7_days')."
+      - name: "end_date"
+        type: "string"
+        required: false
+        default: null
+        description: "End date for multi-day ranges (YYYY-MM-DD)."
+      - name: "granularity"
+        type: "string"
+        required: false
+        default: "daily"
+        enum: ["daily", "hourly", "30min", "15min", "shift_wise"]
+        description: "Time aggregation bucket resolution."
+      - name: "zones"
+        type: "list[string]"
+        required: false
+        default: null
+        description: "Filter to specific cost centers (up to 17 valid zones)."
+      - name: "equipment"
+        type: "list[string]"
+        required: false
+        default: null
+        description: "Filter to specific equipment categories (up to 8 valid categories)."
+    backing_services:
+      - "src.services.aggregation_service.AggregationService"
+      - "src.services.telemetry.facility_telemetry"
+      - "src.services.telemetry.generators_telemetry"
+      - "src.services.telemetry.equipments_telemetry"
+      - "src.services.telemetry.zones_telemetry"
+      - "src.services.tariff_service.TariffService"
+    frontend_mapping: >
+      Synthesized by streaming_optimized.py into create_time_series_chart,
+      create_breakdown_chart, create_demand_utilization_gauge, or create_load_heatmap
+      for native Recharts rendering in the React UI.
+
+# ==============================================================================
+# 4. Telemetry Architecture & Tools Catalog
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 4.0. OOP Telemetry Class Hierarchy & Capability Gating
+# ------------------------------------------------------------------------------
+telemetry_architecture:
+  base_class:
+    class_name: "BaseTelemetryService"
+    location: "yamaha_chatbot_backend/src/services/telemetry/base.py"
+    description: >
+      Authoritative single point of edit for all industrial EMS telemetry calculations.
+      Encapsulates cumulative counter deltas (max - min), instantaneous statistical metrics,
+      24-hour hourly profile curves, Section 9 shift breakdown rules, ClickHouse/SQLite
+      execution, and capability gating.
+    capabilities_enum: "TelemetryCapability"
+    error_class: "UnsupportedCapabilityError"
+
+  child_tiers:
+    - tier: "facility"
+      class_name: "FacilityTelemetryService"
+      singleton: "facility_telemetry"
+      location: "yamaha_chatbot_backend/src/services/telemetry/facility.py"
+      supported_capabilities:
+        - "CUMULATIVE_ENERGY: 11kV Grid Incomer & Solar generation counter deltas"
+        - "INSTANTANEOUS_POWER: Solar kW & Transformer kVA apparent power"
+        - "HOURLY_PROFILE: 24h solar & facility profiles"
+        - "SHIFT_BREAKDOWN: Section 9 Shift A, B (with 00:40 rollover), Shift C"
+        - "POWER_QUALITY: Power factor (0.997 lag), THD voltage/current, reactive kVARh"
+        - "THRESHOLD_MONITORING: 1475 kVA contract & 1180 kVA excursion monitoring"
+        - "UTILITIES_STEAM: Blower room steam flow kg/h, bar, and kg consumed"
+      unsupported: ["RUN_DETECTION: Generator-specific running power threshold not applicable"]
+
+    - tier: "generators"
+      class_name: "GeneratorsTelemetryService"
+      singleton: "generators_telemetry"
+      location: "yamaha_chatbot_backend/src/services/telemetry/generators.py"
+      supported_capabilities:
+        - "CUMULATIVE_ENERGY: DG 300kVA kWh generation counter delta"
+        - "INSTANTANEOUS_POWER: DG real power kW"
+        - "RUN_DETECTION: Real power > 1.0 kW threshold, runtime minutes/hours, starts/stops"
+        - "HOURLY_PROFILE: DG generation hourly curve"
+      unsupported:
+        - "SHIFT_BREAKDOWN: DG runs during grid outages only, not on factory shift schedules"
+        - "POWER_QUALITY: No grid THD or PF compliance on DG incomer"
+        - "THRESHOLD_MONITORING: No grid contract kVA threshold"
+        - "UTILITIES_STEAM: No steam telemetry"
+
+    - tier: "equipments"
+      class_name: "EquipmentsTelemetryService"
+      singleton: "equipments_telemetry"
+      location: "yamaha_chatbot_backend/src/services/telemetry/equipments.py"
+      supported_capabilities:
+        - "CUMULATIVE_ENERGY: 8 standard categories (Lighting, Molding, Compressor, Airconditioning, Dust_Collector, Paintshop, Production_Power, Others)"
+        - "INSTANTANEOUS_POWER: Machine-level diagnostic telemetry snapshots"
+        - "HOURLY_PROFILE: Category-level 24-hour load curves"
+      mandatory_exclusions:
+        - "Dust_Collector.G0_144_Dust_Collector/Energies/Real Energy/Real Energy Into the Load"
+        - "Airconditioning.PA_FA_Inspection_Box-AC/Energies/Real Energy/Real Energy Into the Load"
+      unsupported:
+        - "POWER_QUALITY: Harmonics THD is measured at transformer level"
+        - "THRESHOLD_MONITORING: Contract kVA is substation transformer level"
+        - "UTILITIES_STEAM: Machinery categories do not measure steam"
+
+    - tier: "zones"
+      class_name: "ZonesTelemetryService"
+      singleton: "zones_telemetry"
+      location: "yamaha_chatbot_backend/src/services/telemetry/zones.py"
+      supported_capabilities:
+        - "CUMULATIVE_ENERGY: 17 organizational cost center totals via mapped meter lists"
+        - "HOURLY_PROFILE: Cost center 24-hour energy curves"
+      unsupported:
+        - "INSTANTANEOUS_POWER: Cost centers aggregate multiple meters; summing instantaneous kW violates Section 1"
+        - "POWER_QUALITY: No grid compliance at cost center level"
+        - "THRESHOLD_MONITORING: No contract kVA on zones"
+        - "UTILITIES_STEAM: No steam telemetry on electrical cost centers"
+
+# ------------------------------------------------------------------------------
+# 4.1. EMS Telemetry & Energy Management Tools
+# ------------------------------------------------------------------------------
+ems_telemetry_tools:
+  - name: "get_energy_consumption"
+    file: "yamaha_chatbot_backend/src/tools/energy_tools.py"
+    line_number: 34
+    category: "Grid Telemetry (Facility Tier)"
+    capability: >
+      Calculates total facility grid electricity consumption (kWh) on the HT_Room 11kV
+      Main Incomer for a specific IST date (YYYY-MM-DD). Uses authoritative counter delta
+      formula: max(cumulative_kWh) - min(cumulative_kWh).
+    backing_service: "src.services.telemetry.facility_telemetry.get_grid_energy"
+    data_source: "ClickHouse: opcda_readings (tag: Incomer.11kV_Main_Incomer/Active_Energy_Import_kWh)"
+    parameters:
+      - name: "date"
+        type: "string"
+        required: true
+        description: "Date in YYYY-MM-DD format (IST)."
+    returns:
+      type: "dict"
+      fields:
+        - "date: str"
+        - "total_energy_kwh: float"
+        - "meter_id: str"
+        - "calculation_method: str"
+    frontend_ui_component: "frontend/src/components/assistant-ui/tools/energy-tools.tsx (GetEnergyConsumptionTool)"
+    example_prompts:
+      - "What was yesterday's grid consumption?"
+      - "Total energy consumed on 2026-10-21"
+
+  - name: "get_solar_generation"
+    file: "yamaha_chatbot_backend/src/tools/energy_tools.py"
+    line_number: 20
+    category: "Renewable Generation"
+    capability: >
+      Queries rooftop 100kW solar plant (Incomer.Incomer_Solar_100kW/) generation metrics.
+      Supports both daily rollup summary (total kWh, peak kW, active hours, avg power)
+      and full 24-hour hour-by-hour telemetry breakdowns.
+    backing_service: "src.services.telemetry.facility_telemetry.get_solar_generation"
+    data_source: "ClickHouse: opcda_readings (tags: Incomer.Incomer_Solar_100kW/*)"
+    parameters:
+      - name: "date"
+        type: "string"
+        required: true
+        description: "Date in YYYY-MM-DD format (IST)."
+      - name: "granularity"
+        type: "string"
+        required: false
+        default: "daily"
+        enum: ["daily", "hourly"]
+        description: "Daily summary or 24-hour hour-wise generation breakdown."
+    returns:
+      type: "dict"
+      fields:
+        - "date: str"
+        - "total_energy_kwh: float"
+        - "peak_active_power_kw: float"
+        - "avg_active_power_kw: float"
+        - "generation_hours: float"
+        - "hourly_breakdown: list[dict] (when granularity=hourly)"
+    frontend_ui_component: "Default Markdown Table / Assistant-UI text stream"
+    example_prompts:
+      - "Give me yesterday solar generation"
+      - "Show hour wise solar generation breakdown"
+
+  - name: "get_power_factor"
+    file: "yamaha_chatbot_backend/src/tools/energy_tools.py"
+    line_number: 82
+    category: "Power Quality & Efficiency"
+    capability: >
+      Calculates total facility power factor (PF) on the HT_Room 11kV Main Incomer and
+      substation transformers for date (YYYY-MM-DD). Raw values are on a 0-100 scale,
+      scaled by / 100.0 into standard 0-1 range. Returns overall average lagging PF, min/max,
+      per-phase PF, and utility tariff HT_1 compliance verdict.
+    backing_service: "src.services.telemetry.facility_telemetry.get_power_factor"
+    data_source: "ClickHouse: opcda_readings (tags: HT_Room.11kV_Main_Incomer/Power Factor/PF lag tot, Incomer.North_Utilities_2000KVA_Transformer/...)"
+    parameters:
+      - name: "date"
+        type: "string"
+        required: true
+        description: "Date in YYYY-MM-DD format (IST)."
+    returns:
+      type: "dict"
+      fields:
+        - "date: str"
+        - "facility_power_factor: dict (meter, nature, average_pf, average_pf_percentage, min_pf, max_pf, phase_breakdown, status)"
+        - "transformer_power_factors: dict (north_utilities_2000kva, south_utilities_1000kva)"
+        - "compliance_verdict: str"
+    frontend_ui_component: "Default Markdown / Assistant-UI text stream"
+    example_prompts:
+      - "What is the total power factor yesterday?"
+      - "Check plant PF and transformer power factor for 2026-10-21"
+
+  - name: "get_shift_wise_consumption"
+    file: "yamaha_chatbot_backend/src/tools/energy_tools.py"
+    line_number: 40
+    category: "Shift Operations"
+    capability: >
+      Retrieves electricity consumption (kWh) across manufacturing shifts: Shift A (08:00–17:00),
+      Shift B (17:00–00:40 next day), and Shift C (00:40–08:00). Strictly applies the
+      Section 9 00:40 Rule where readings between 00:00 and 00:40 belong to the previous day's Shift B.
+    backing_service: "src.services.telemetry.facility_telemetry.get_grid_shift_energy"
+    data_source: "ClickHouse: opcda_readings & tag_daily_energy_rollup"
+    parameters:
+      - name: "date"
+        type: "string"
+        required: true
+        description: "Date in YYYY-MM-DD format (IST)."
+    returns:
+      type: "dict"
+      fields:
+        - "date: str"
+        - "shifts: dict[Shift A, Shift B, Shift C]"
+        - "total_shift_energy_kwh: float"
+        - "discrepancy_vs_daily: float"
+    frontend_ui_component: "frontend/src/components/assistant-ui/tools/energy-tools.tsx (GetShiftWiseConsumptionTool)"
+    example_prompts:
+      - "Show shift wise consumption for yesterday"
+      - "How much power did Shift C consume on 2026-10-20?"
+
+  - name: "get_cost_and_tariff"
+    file: "yamaha_chatbot_backend/src/tools/energy_tools.py"
+    line_number: 49
+    category: "Tariff & Billing"
+    capability: >
+      Calculates daily electricity billing under the statutory Tariff HT_1 TOD
+      (Time of Day) rate schedule. Rescales hourly energy to match authoritative daily
+      incomer counter (scale = true_daily_kWh / sum(hourly_kWh)) and computes total INR cost
+      across Off-Peak, Normal, and Peak tariff bands.
+    backing_service: "src.services.tariff_service.TariffService.calculate_daily_cost"
+    data_source: "ClickHouse: opcda_readings (Main Incomer) + tariff rules"
+    parameters:
+      - name: "date"
+        type: "string"
+        required: true
+        description: "Date in YYYY-MM-DD format (IST)."
+    returns:
+      type: "dict"
+      fields:
+        - "date: str"
+        - "total_cost_inr: float"
+        - "true_daily_kwh: float"
+        - "band_summary: dict[Off-Peak, Normal, Peak]"
+        - "hourly_breakdown: list[dict]"
+    frontend_ui_component: "frontend/src/components/assistant-ui/tools/energy-tools.tsx (GetCostAndTariffTool)"
+    example_prompts:
+      - "What is yesterday's electricity bill?"
+      - "Break down electricity cost by tariff bands for 2026-10-18"
+
+  - name: "get_peak_demand_analysis"
+    file: "yamaha_chatbot_backend/src/tools/energy_tools.py"
+    line_number: 58
+    category: "Demand & Substation"
+    capability: >
+      Analyzes peak apparent power demand (kVA) on the South Utilities Transformer against
+      the 1475.0 kVA contracted capacity. Identifies hourly peak demand profiles, contract
+      utilization percentage, and flags excursion events exceeding the 80% threshold (1180.0 kVA).
+    backing_service: "src.services.telemetry.facility_telemetry.get_peak_demand"
+    data_source: "ClickHouse: opcda_readings (tag: South_Utilities.Transformer/Apparent_Power_kVA)"
+    parameters:
+      - name: "date"
+        type: "string"
+        required: true
+        description: "Date in YYYY-MM-DD format (IST)."
+    returns:
+      type: "dict"
+      fields:
+        - "date: str"
+        - "contracted_capacity_kva: float (1475.0)"
+        - "threshold_kva: float (1180.0)"
+        - "peak_demand_kva: float"
+        - "peak_utilization_pct: float"
+        - "excursions: list[dict]"
+    frontend_ui_component: "frontend/src/components/assistant-ui/tools/energy-tools.tsx (GetPeakDemandAnalysisTool)"
+    example_prompts:
+      - "Check peak demand yesterday"
+      - "Did we exceed the 1180 kVA threshold on Monday?"
+
+  - name: "get_dg_generator_status"
+    file: "yamaha_chatbot_backend/src/tools/energy_tools.py"
+    line_number: 68
+    category: "Backup Power"
+    capability: >
+      Extracts monthly Diesel Generator (DG) operational telemetry. Computes total runtime
+      hours (when real power > 1.0 kW), total energy generated (kWh), engine start/stop
+      cycles, and detailed run event logs. Note: Requires YYYY-MM month parameter.
+    backing_service: "src.services.telemetry.generators_telemetry.get_monthly_metrics"
+    data_source: "ClickHouse: opcda_readings (DG tags: Real_Power_kW, Total_Active_Energy_kWh)"
+    parameters:
+      - name: "month"
+        type: "string"
+        required: true
+        description: "Month in YYYY-MM format (e.g., '2026-10')."
+    returns:
+      type: "dict"
+      fields:
+        - "month: str"
+        - "runtime_hours: float"
+        - "energy_generated_kwh: float"
+        - "start_count: int"
+        - "runs: list[dict]"
+    frontend_ui_component: "Default Markdown Table / Text"
+    example_prompts:
+      - "How many hours did the DG run in 2026-10?"
+      - "Check diesel generator runtime and start cycles for October"
+
+  - name: "get_power_quality_and_utilities"
+    file: "yamaha_chatbot_backend/src/tools/energy_tools.py"
+    line_number: 93
+    category: "Power Quality & Utilities"
+    capability: >
+      Retrieves electrical quality and non-electrical utilities for a date:
+      'power_factor': Total plant power factor (PF) on Main Incomer and transformers;
+      'thd': Voltage THD (limit 5%) and Current THD (limit 8% avg across 3 phases);
+      'reactive_energy': Cumulative kVARh on South & North transformers;
+      'steam': Blower Room steam snapshot (flow kg/h, pressure bar) and cumulative kg.
+    backing_service: "src.services.telemetry.facility_telemetry"
+    data_source: "ClickHouse: opcda_readings (THD, PF, kVARh, Steam tags)"
+    parameters:
+      - name: "metric"
+        type: "string"
+        required: true
+        enum: ["power_factor", "thd", "reactive_energy", "steam"]
+        description: "Target metric type."
+      - name: "date"
+        type: "string"
+        required: true
+        description: "Date in YYYY-MM-DD format (IST)."
+    returns:
+      type: "dict"
+      fields:
+        - "metric: str"
+        - "date: str"
+        - "data: dict (metric specific payload)"
+    frontend_ui_component: "Default Markdown / assistant-ui stream"
+    example_prompts:
+      - "Check THD levels yesterday"
+      - "Show steam consumption and pressure in Blower Room"
+
+  - name: "get_breakdown_summary"
+    file: "yamaha_chatbot_backend/src/tools/energy_tools.py"
+    line_number: 98
+    category: "Data Summaries"
+    capability: >
+      DATA-ONLY TOOL — Returns exact numerical tabular breakdown without generating charts.
+      Supports 'equipment_wise' (8 categories: Lighting, Molding, Compressor, etc.) or
+      'zone_wise' (17 plant cost centers). For charts, use create_visualization.
+    backing_service: "src.services.telemetry.equipments_telemetry / zones_telemetry"
+    data_source: "ClickHouse: tag_daily_energy_rollup / opcda_readings"
+    parameters:
+      - name: "group_by"
+        type: "string"
+        required: true
+        enum: ["equipment_wise", "zone_wise"]
+        description: "Aggregation group dimension."
+      - name: "date"
+        type: "string"
+        required: true
+        description: "Date in YYYY-MM-DD format (IST)."
+    returns:
+      type: "dict"
+      fields:
+        - "group_by: str"
+        - "date: str"
+        - "total_kwh: float"
+        - "breakdown: list[dict]"
+    frontend_ui_component: "Default Markdown Table"
+    example_prompts:
+      - "Give me equipment wise numbers for yesterday"
+      - "Show tabular zone energy data for 2026-10-21"
+
+  - name: "diagnose_high_consumption"
+    file: "yamaha_chatbot_backend/src/tools/energy_tools.py"
+    line_number: 114
+    category: "RCA & Diagnostics"
+    capability: >
+      Automated Root Cause Analysis (RCA) comparing a given day against the rolling 30-day
+      baseline. Flags anomalous kWh increases, isolates top contributing machinery categories
+      and cost centers, and audits Shift C (night) baseload leakage.
+    backing_service: "src.services.rca_service.RCAService.diagnose_day"
+    data_source: "ClickHouse: historical rollups and multi-meter aggregations"
+    parameters:
+      - name: "date"
+        type: "string"
+        required: true
+        description: "Date in YYYY-MM-DD format (IST)."
+    returns:
+      type: "dict"
+      fields:
+        - "date: str"
+        - "is_anomaly: bool"
+        - "baseline_kwh: float"
+        - "actual_kwh: float"
+        - "top_culprits: list[dict]"
+        - "verdict: str"
+    frontend_ui_component: "Default Markdown / Diagnostic Card"
+    example_prompts:
+      - "Why was power consumption so high on 2026-10-18?"
+      - "Diagnose high energy consumption yesterday"
+
+  - name: "diagnose_spikes_and_anomalies"
+    file: "yamaha_chatbot_backend/src/tools/energy_tools.py"
+    line_number: 123
+    category: "RCA & Diagnostics"
+    capability: >
+      Deep telemetry scanner that isolates sudden spikes and physical engineering anomalies:
+      peak demand surges (>1180 kVA threshold with culprit machine names), hourly spikes,
+      Shift C night baseload inflation, power quality violations, or steam pressure drops.
+    backing_service: "src.services.rca_service.RCAService.detect_and_explain_spikes"
+    data_source: "ClickHouse: raw opcda_readings high-frequency telemetry"
+    parameters:
+      - name: "date"
+        type: "string"
+        required: true
+        description: "Date in YYYY-MM-DD format (IST)."
+      - name: "anomaly_type"
+        type: "string"
+        required: false
+        default: "all"
+        enum: ["all", "peak_demand", "hourly_spike", "shift_c_baseload", "power_quality", "steam"]
+        description: "Target anomaly dimension to scan."
+    returns:
+      type: "dict"
+      fields:
+        - "date: str"
+        - "anomaly_type: str"
+        - "anomalies_detected: int"
+        - "details: list[dict]"
+    frontend_ui_component: "Default Markdown"
+    example_prompts:
+      - "Scan for energy spikes on 2026-10-19"
+      - "Explain power quality and peak demand excursions yesterday"
+
+  - name: "explain_hourly_anomaly"
+    file: "yamaha_chatbot_backend/src/tools/energy_tools.py"
+    line_number: 139
+    category: "RCA & Diagnostics"
+    capability: >
+      Microscopic engineering deep-dive into a specific 60-minute window (hour 0-23).
+      Returns facility kWh, peak kVA, full equipment breakdown, top 5 individual machinery
+      meters responsible for the load, and power quality readings during that hour.
+    backing_service: "src.services.rca_service.RCAService.explain_hourly_anomaly"
+    data_source: "ClickHouse: raw opcda_readings"
+    parameters:
+      - name: "date"
+        type: "string"
+        required: true
+        description: "Date in YYYY-MM-DD format (IST)."
+      - name: "hour"
+        type: "integer"
+        required: true
+        description: "Hour of day (0-23 IST, e.g. 14 for 14:00-15:00)."
+    returns:
+      type: "dict"
+      fields:
+        - "date: str"
+        - "hour: int"
+        - "facility_kwh: float"
+        - "peak_kva: float"
+        - "top_machines: list[dict]"
+        - "verdict: str"
+    frontend_ui_component: "Default Markdown"
+    example_prompts:
+      - "Explain what caused the spike at 2 PM yesterday"
+      - "Analyze machinery consumption at hour 14 on 2026-10-19"
+
+  - name: "search_ems_knowledge_base"
+    file: "yamaha_chatbot_backend/src/tools/energy_tools.py"
+    line_number: 157
+    category: "RAG & Documentation"
+    capability: >
+      RAG knowledge base retriever querying the authoritative Yamaha EMS reference documents
+      (energy-ai-assistant-reference.md, EMS_DATA_COMPONENTS_AND_RULES.md, docs/components/*.md).
+      Retrieves formulas, meter hierarchies, known conflict resolutions (e.g. AC-1/AC-2), and rules.
+    backing_service: "src.rag.retriever.ems_kb"
+    data_source: "Local Markdown Documents & TF-IDF / Semantic Retriever"
+    parameters:
+      - name: "query"
+        type: "string"
+        required: true
+        description: "Search question or technical term (e.g., 'Section 9 shift rule', 'TOD tariff bands')."
+    returns:
+      type: "dict"
+      fields:
+        - "query: str"
+        - "results: list[dict (header, content, relevance)]"
+    frontend_ui_component: "Default Markdown"
+    example_prompts:
+      - "What is the shift boundary rule for Shift B?"
+      - "Explain how TOD tariff scales hourly energy"
+
+  - name: "get_realtime_device_telemetry"
+    file: "yamaha_chatbot_backend/src/tools/energy_tools.py"
+    line_number: 185
+    category: "Live Telemetry"
+    capability: >
+      Retrieves live real-time electrical diagnostic telemetry snapshots for 10 representative
+      plant devices (HT_Room, North_Utilities, Molding, Compressor, Airconditioning, Lighting,
+      Solar, DG, Dust_Collector, Paintshop). Returns V, I, PF, kW, kVA, Hz, and operating status.
+    backing_service: "src.db.chat_history.chat_repo.get_live_device_telemetry"
+    data_source: "SQLite: yamaha_mock.db / ClickHouse live buffer"
+    parameters:
+      - name: "device_name"
+        type: "string"
+        required: false
+        default: null
+        description: "Filter to specific device name or omit for all representative devices."
+    returns:
+      type: "dict"
+      fields:
+        - "status: str"
+        - "count: int"
+        - "telemetry: list[dict (voltage, current, power_factor, active_power_kw, etc.)]"
+    frontend_ui_component: "frontend/src/components/assistant-ui/tools/energy-tools.tsx (GetRealtimeDeviceTelemetryTool)"
+    example_prompts:
+      - "Show live meter telemetry"
+      - "Get real-time voltage and power factor for Compressor"
+
+  - name: "execute_custom_sql"
+    file: "yamaha_chatbot_backend/src/tools/energy_tools.py"
+    line_number: 166
+    category: "Ad-hoc SQL"
+    capability: >
+      Executes read-only SELECT SQL queries against the telemetry database for arbitrary
+      custom analytical inquiries. Enforces strict safety rules (blocks INSERT, UPDATE, DELETE,
+      DROP, ALTER, TRUNCATE) and automatically clamps responses to LIMIT 50.
+    backing_service: "src.db.sqlite_client.db_client / src.db.clickhouse_client.clickhouse_client"
+    data_source: "ClickHouse: opcda_readings, tag_daily_energy_rollup"
+    parameters:
+      - name: "query"
+        type: "string"
+        required: true
+        description: "Read-only SELECT SQL query string."
+    returns:
+      type: "dict"
+      fields:
+        - "count: int"
+        - "rows: list[dict]"
+    frontend_ui_component: "Default Markdown Table"
+    example_prompts:
+      - "SELECT tag_id, max(value) FROM opcda_readings WHERE date = '2026-10-21' GROUP BY tag_id"
+
+# ------------------------------------------------------------------------------
+# 4.2. Utility & Context Tools (6 Tools)
+# ------------------------------------------------------------------------------
+utility_tools:
+  - name: "get_current_datetime_ist"
+    file: "yamaha_chatbot_backend/src/tools/util_tools.py"
+    line_number: 23
+    category: "Time & Schedule"
+    capability: >
+      Returns current date, time, day of week, active manufacturing shift (A, B, or C),
+      and active shift window in IST (Asia/Kolkata). Crucial for resolving 'now', 'today',
+      or the currently operating production shift.
+    backing_service: "Python datetime (Asia/Kolkata timezone)"
+    parameters: []
+    returns:
+      type: "dict"
+      fields:
+        - "current_date: str (YYYY-MM-DD)"
+        - "current_time: str (HH:MM:SS)"
+        - "timezone: str ('Asia/Kolkata')"
+        - "active_shift: str ('A' | 'B' | 'C')"
+        - "active_shift_window: str"
+    frontend_ui_component: "frontend/src/components/assistant-ui/tools/energy-tools.tsx (GetCurrentDatetimeIstTool)"
+    example_prompts:
+      - "What shift is currently running?"
+      - "What time is it in the plant right now?"
+
+  - name: "resolve_relative_date_window"
+    file: "yamaha_chatbot_backend/src/tools/util_tools.py"
+    line_number: 63
+    category: "Time & Schedule"
+    capability: >
+      Resolves relative colloquial time expressions ('today', 'yesterday', 'this_week',
+      'last_week', 'this_month', 'last_month', 'last_7_days', 'last_30_days') into exact
+      IST start and end dates and ISO timestamps.
+    backing_service: "src.tools.util_tools"
+    parameters:
+      - name: "expression"
+        type: "string"
+        required: true
+        enum: ["today", "yesterday", "this_week", "last_week", "this_month", "last_month", "last_7_days", "last_30_days"]
+        description: "Relative date phrase to resolve."
+    returns:
+      type: "dict"
+      fields:
+        - "expression: str"
+        - "start_date: str"
+        - "end_date: str"
+        - "days_count: int"
+    frontend_ui_component: "Default Markdown / Internal agent resolution"
+    example_prompts:
+      - "Resolve 'last_7_days'"
+      - "What are the start and end dates of last week?"
+
+  - name: "get_shift_boundaries"
+    file: "yamaha_chatbot_backend/src/tools/util_tools.py"
+    line_number: 128
+    category: "Shift Operations"
+    capability: >
+      Calculates exact start and end boundary timestamps in IST for a given shift on a date.
+      Strictly accounts for Shift B crossing midnight into next day 00:40:00 per Section 9.
+    backing_service: "src.tools.util_tools"
+    parameters:
+      - name: "date_str"
+        type: "string"
+        required: true
+        description: "Date string (YYYY-MM-DD)."
+      - name: "shift"
+        type: "string"
+        required: true
+        enum: ["A", "B", "C"]
+        description: "Target shift."
+    returns:
+      type: "dict"
+      fields:
+        - "date: str"
+        - "shift: str"
+        - "start_timestamp: str"
+        - "end_timestamp: str"
+    frontend_ui_component: "Default Markdown"
+    example_prompts:
+      - "What are the exact start and end hours for Shift B on 2026-10-21?"
+
+  - name: "search_project_files"
+    file: "yamaha_chatbot_backend/src/tools/util_tools.py"
+    line_number: 171
+    category: "Workspace Search"
+    capability: >
+      Safely searches workspace directories for files matching glob patterns (*.md, *.sql, etc.).
+      Prunes .git, .venv, and node_modules. Protects against path traversal.
+    backing_service: "os.walk with path resolution"
+    parameters:
+      - name: "pattern"
+        type: "string"
+        required: true
+        description: "Glob or filename pattern."
+      - name: "sub_dir"
+        type: "string"
+        required: false
+        default: null
+        description: "Optional subfolder constraint."
+    returns:
+      type: "dict"
+      fields:
+        - "pattern: str"
+        - "count: int"
+        - "files: list[dict (relative_path, size_bytes, modified)]"
+    frontend_ui_component: "Default Markdown"
+
+  - name: "read_project_file"
+    file: "yamaha_chatbot_backend/src/tools/util_tools.py"
+    line_number: 213
+    category: "Workspace Search"
+    capability: >
+      Safely reads file content from within the project root with pagination (start_line, num_lines).
+      Prevents directory traversal outside project root.
+    backing_service: "Local file I/O"
+    parameters:
+      - name: "file_path"
+        type: "string"
+        required: true
+        description: "Relative path inside project repository."
+      - name: "start_line"
+        type: "integer"
+        required: false
+        default: 1
+        description: "1-based starting line number."
+      - name: "num_lines"
+        type: "integer"
+        required: false
+        default: 100
+        description: "Number of lines to read."
+    returns:
+      type: "dict"
+      fields:
+        - "file_path: str"
+        - "start_line: int"
+        - "end_line: int"
+        - "total_lines: int"
+        - "content: str"
+    frontend_ui_component: "Default Markdown"
+
+  - name: "search_tag_catalog"
+    file: "yamaha_chatbot_backend/src/tools/util_tools.py"
+    line_number: 259
+    category: "Meter Catalog"
+    capability: >
+      Fuzzy and alias-tolerant search across authoritative Yamaha meter tag catalogs.
+      Resolves misspellings ('mouldng', 'chiler', 'compreser') and aliases ('lights', 'ac', 'admin')
+      to exact ClickHouse tag IDs, Cost Centers, and Equipment Categories.
+    backing_service: "src.core.normalizers (fuzzy string matching)"
+    parameters:
+      - name: "keyword"
+        type: "string"
+        required: true
+        description: "Meter tag keyword, machine name, or abbreviation."
+    returns:
+      type: "dict"
+      fields:
+        - "keyword: str"
+        - "resolved_alias: str"
+        - "match_count: int"
+        - "matches: list[dict (tag_id, mapping_type, group_name)]"
+    frontend_ui_component: "Default Markdown"
+    example_prompts:
+      - "What is the tag ID for compressor?"
+      - "Search meter catalog for molding"
+
+# ------------------------------------------------------------------------------
+# 4.3. Visualization & Chart Tools (8 Tools)
+# ------------------------------------------------------------------------------
+visualization_and_chart_tools:
+  - name: "create_visualization"
+    file: "yamaha_chatbot_backend/src/skills/visualization_skill.py"
+    line_number: 402
+    category: "Unified Skill Tool"
+    status: "PRIMARY (Recommended)"
+    capability: >
+      Unified tool wrapping VisualizationSkill. Single entry point for all chart generation.
+      Dispatches to AggregationService, DemandService, ShiftService, or SolarService.
+      Supports multi-chart generation and natural language prompt parsing.
+    backing_service: "src.skills.visualization_skill.visualization_skill"
+    parameters:
+      - name: "description"
+        type: "string"
+        required: true
+        description: "Description of chart desired (e.g. 'hourly solar generation line chart', 'stacked bar for zones')."
+      - name: "start_date"
+        type: "string"
+        required: false
+        default: "yesterday"
+        description: "Start date (YYYY-MM-DD or relative string)."
+      - name: "end_date"
+        type: "string"
+        required: false
+        default: null
+        description: "End date for multi-day date ranges."
+      - name: "granularity"
+        type: "string"
+        required: false
+        default: "daily"
+        enum: ["daily", "hourly", "30min", "15min", "shift_wise"]
+        description: "Aggregation time resolution."
+      - name: "zones"
+        type: "list[string]"
+        required: false
+        default: null
+        description: "Zone cost centers filter."
+      - name: "equipment"
+        type: "list[string]"
+        required: false
+        default: null
+        description: "Equipment categories filter."
+    frontend_ui_component: "Translated dynamically to assistant-ui Recharts components"
+
+  - name: "create_demand_utilization_gauge"
+    file: "yamaha_chatbot_backend/src/tools/chart_tools.py"
+    line_number: 459
+    category: "Specialized Gauge"
+    status: "ACTIVE in Unified Mode"
+    capability: >
+      Constructs a specialized radial gauge displaying peak apparent power demand (kVA)
+      against the 1475.0 kVA contracted capacity, color-coded with normal (<80%),
+      warning (80-95%), and critical (>95%) thresholds.
+    backing_service: "src.services.demand_service.DemandService"
+    parameters:
+      - name: "date"
+        type: "string"
+        required: true
+        description: "Date in YYYY-MM-DD format (IST)."
+    frontend_ui_component: "frontend/src/components/assistant-ui/tools/chart-tool.tsx (create_demand_utilization_gauge)"
+
+  - name: "create_correlation_scatter_plot"
+    file: "yamaha_chatbot_backend/src/tools/chart_tools.py"
+    line_number: 491
+    category: "Specialized Scatter"
+    status: "ACTIVE in Unified Mode"
+    capability: >
+      Generates 2D scatter plots for engineering correlations: Steam Flow vs Pressure,
+      Active Power (kW) vs THD, or Apparent Power (kVA) vs Power Factor.
+    backing_service: "ClickHouse opcda_readings pairwise queries"
+    parameters:
+      - name: "date"
+        type: "string"
+        required: true
+        description: "Date in YYYY-MM-DD format (IST)."
+      - name: "pair_type"
+        type: "string"
+        required: true
+        enum: ["steam_flow_vs_pressure", "power_vs_thd", "kva_vs_pf"]
+        description: "Correlation variable pair."
+    frontend_ui_component: "frontend/src/components/assistant-ui/tools/chart-tool.tsx (create_correlation_scatter_plot)"
+
+  - name: "aggregate_energy_telemetry"
+    file: "yamaha_chatbot_backend/src/tools/chart_tools.py"
+    line_number: 144
+    category: "Legacy Multi-Dimension Aggregator"
+    status: "STANDALONE / LEGACY"
+    capability: >
+      Aggregates energy telemetry across multiple equipment categories or cost centers,
+      supporting time-series lines, stacked bars, or areas.
+    backing_service: "src.services.aggregation_service.aggregation_service"
+    parameters:
+      - name: "aggregation_type"
+        type: "string"
+        required: false
+        default: "equipment_wise"
+        enum: ["equipment_wise", "zone_wise", "incomer_total"]
+      - name: "start_date"
+        type: "string"
+        required: false
+        default: "yesterday"
+      - name: "end_date"
+        type: "string"
+        required: false
+        default: null
+      - name: "granularity"
+        type: "string"
+        required: false
+        default: "daily"
+      - name: "chart_type"
+        type: "string"
+        required: false
+        default: "auto"
+    frontend_ui_component: "frontend/src/components/assistant-ui/tools/chart-tool.tsx (aggregate_energy_telemetry)"
+
+  - name: "create_breakdown_chart"
+    file: "yamaha_chatbot_backend/src/tools/chart_tools.py"
+    line_number: 55
+    category: "Legacy Breakdown"
+    status: "STANDALONE / LEGACY & FRONTEND RENDERER"
+    capability: >
+      Generates Donut, Pie, or Bar breakdown for single-day equipment, zone, or TOD tariff bands.
+      Actively used by the frontend to render part-to-whole categorical breakdowns.
+    backing_service: "src.services.breakdown_service / tariff_service"
+    parameters:
+      - name: "date"
+        type: "string"
+        required: true
+      - name: "breakdown_type"
+        type: "string"
+        required: true
+        enum: ["equipment_wise", "zone_wise", "tariff_bands"]
+      - name: "preferred_type"
+        type: "string"
+        required: false
+        default: "auto"
+        enum: ["auto", "donut", "pie", "bar", "stacked_bar"]
+    frontend_ui_component: "frontend/src/components/assistant-ui/tools/chart-tool.tsx (create_breakdown_chart)"
+
+  - name: "create_time_series_chart"
+    file: "yamaha_chatbot_backend/src/tools/chart_tools.py"
+    line_number: 232
+    category: "Legacy Time Series"
+    status: "STANDALONE / LEGACY & FRONTEND RENDERER"
+    capability: >
+      Generates 24-hour hourly or multi-day time-series line, area, or bar curves for
+      facility energy, solar generation, power quality, or transformer load.
+    backing_service: "src.services.energy_service / aggregation_service"
+    parameters:
+      - name: "date"
+        type: "string"
+        required: true
+      - name: "metric"
+        type: "string"
+        required: true
+        enum: ["facility_energy", "solar_generation", "apparent_power", "current_thd"]
+      - name: "preferred_type"
+        type: "string"
+        required: false
+        default: "auto"
+        enum: ["auto", "line", "area", "bar"]
+    frontend_ui_component: "frontend/src/components/assistant-ui/tools/chart-tool.tsx (create_time_series_chart)"
+
+  - name: "create_shift_comparison_chart"
+    file: "yamaha_chatbot_backend/src/tools/chart_tools.py"
+    line_number: 383
+    category: "Legacy Shift Comparison"
+    status: "STANDALONE / LEGACY"
+    capability: >
+      Generates grouped bar charts comparing Shifts A, B, and C consumption across multiple dates.
+    backing_service: "src.services.shift_service.ShiftService"
+    parameters:
+      - name: "start_date"
+        type: "string"
+        required: true
+      - name: "end_date"
+        type: "string"
+        required: false
+        default: null
+      - name: "preferred_type"
+        type: "string"
+        required: false
+        default: "auto"
+    frontend_ui_component: "frontend/src/components/assistant-ui/tools/chart-tool.tsx (create_shift_comparison_chart)"
+
+  - name: "create_load_heatmap"
+    file: "yamaha_chatbot_backend/src/tools/chart_tools.py"
+    line_number: 644
+    category: "Legacy Heatmap"
+    status: "STANDALONE / LEGACY & FRONTEND RENDERER"
+    capability: >
+      Constructs a 2D load matrix (Hour of Day 00:00–23:00 vs Dates) color-coded by intensity
+      to visualize facility baseload patterns and operational cycles over 7–30 days.
+    backing_service: "ClickHouse hourly rollups"
+    parameters:
+      - name: "start_date"
+        type: "string"
+        required: true
+      - name: "end_date"
+        type: "string"
+        required: true
+    frontend_ui_component: "frontend/src/components/assistant-ui/tools/chart-tool.tsx (create_load_heatmap)"
+
+# ==============================================================================
+# 5. Frontend UI Tool Registration Matrix
+# ==============================================================================
+frontend_tool_renderers:
+  file_chart_tools: "frontend/src/components/assistant-ui/tools/chart-tool.tsx"
+  file_energy_tools: "frontend/src/components/assistant-ui/tools/energy-tools.tsx"
+  registered_components:
+    - tool_name: "get_energy_consumption"
+      file: "frontend/src/components/assistant-ui/tools/energy-tools.tsx"
+      ui_type: "Custom Metric Card (Badge, Counter Delta, Incomer Meter ID)"
+    - tool_name: "get_shift_wise_consumption"
+      file: "frontend/src/components/assistant-ui/tools/energy-tools.tsx"
+      ui_type: "Custom Shift Card (Shift A/B/C breakdown, percentage bars, Section 9 badge)"
+    - tool_name: "get_cost_and_tariff"
+      file: "frontend/src/components/assistant-ui/tools/energy-tools.tsx"
+      ui_type: "Custom Tariff Card (Total INR, TOD band breakdown, scaling factor)"
+    - tool_name: "get_peak_demand_analysis"
+      file: "frontend/src/components/assistant-ui/tools/energy-tools.tsx"
+      ui_type: "Custom Demand Card (kVA gauge, contract utilization %, threshold excursions)"
+    - tool_name: "get_realtime_device_telemetry"
+      file: "frontend/src/components/assistant-ui/tools/energy-tools.tsx"
+      ui_type: "Live Telemetry Grid (V, I, PF, kW, kVA, Hz status badges)"
+    - tool_name: "get_current_datetime_ist"
+      file: "frontend/src/components/assistant-ui/tools/energy-tools.tsx"
+      ui_type: "Plant Clock Badge (Active shift, IST time, working day status)"
+    - tool_name: "create_time_series_chart"
+      file: "frontend/src/components/assistant-ui/tools/chart-tool.tsx"
+      ui_type: "Interactive Recharts SVG (Line / Area / Bar, tooltip, crosshair, zoom)"
+    - tool_name: "create_breakdown_chart"
+      file: "frontend/src/components/assistant-ui/tools/chart-tool.tsx"
+      ui_type: "Interactive Recharts SVG (Donut / Pie / Bar, center KPI label, legend)"
+    - tool_name: "create_demand_utilization_gauge"
+      file: "frontend/src/components/assistant-ui/tools/chart-tool.tsx"
+      ui_type: "Radial Gauge Component (Pointer needle, colored arc zones)"
+    - tool_name: "create_load_heatmap"
+      file: "frontend/src/components/assistant-ui/tools/chart-tool.tsx"
+      ui_type: "2D Heatmap SVG Matrix (24 hours x N days, color-gradient scale)"
+    - tool_name: "create_correlation_scatter_plot"
+      file: "frontend/src/components/assistant-ui/tools/chart-tool.tsx"
+      ui_type: "Scatter Plot SVG (Data points, trend line, correlation coefficient)"
+    - tool_name: "create_shift_comparison_chart"
+      file: "frontend/src/components/assistant-ui/tools/chart-tool.tsx"
+      ui_type: "Grouped Bar Chart (Shift A vs B vs C across dates)"
+    - tool_name: "aggregate_energy_telemetry"
+      file: "frontend/src/components/assistant-ui/tools/chart-tool.tsx"
+      ui_type: "Multi-Series Recharts (Stacked bar / Multi-line series with legend filters)"
+
+# ==============================================================================
+# 6. Service & Data Layer Architecture Matrix
+# ==============================================================================
+service_matrix:
+  - service_class: "BaseTelemetryService"
+    location: "yamaha_chatbot_backend/src/services/telemetry/base.py"
+    data_source: "ClickHouse (opcda_readings & tag_daily_energy_rollup)"
+    description: "Authoritative industrial calculations: counter deltas, instantaneous metrics, shift boundaries, capability gating"
+
+  - service_class: "FacilityTelemetryService (facility_telemetry)"
+    location: "yamaha_chatbot_backend/src/services/telemetry/facility.py"
+    data_source: "ClickHouse (11kV Grid Main Incomer, Solar 100kW, Transformers, PF, THD, Steam)"
+    called_by_tools: ["get_energy_consumption", "get_facility_energy", "get_solar_generation", "get_power_factor", "get_power_quality_and_utilities", "get_shift_wise_consumption", "get_facility_shift_breakdown", "get_peak_demand_analysis"]
+
+  - service_class: "GeneratorsTelemetryService (generators_telemetry)"
+    location: "yamaha_chatbot_backend/src/services/telemetry/generators.py"
+    data_source: "ClickHouse (DG 300kVA power & energy tags)"
+    called_by_tools: ["get_dg_generator_status", "get_generator_daily_status"]
+
+  - service_class: "EquipmentsTelemetryService (equipments_telemetry)"
+    location: "yamaha_chatbot_backend/src/services/telemetry/equipments.py"
+    data_source: "ClickHouse (8 standard equipment categories with mandatory exclusions)"
+    called_by_tools: ["get_equipment_breakdown", "get_equipment_category_energy", "get_equipment_category_hourly_profile", "get_realtime_device_telemetry", "get_breakdown_summary"]
+
+  - service_class: "ZonesTelemetryService (zones_telemetry)"
+    location: "yamaha_chatbot_backend/src/services/telemetry/zones.py"
+    data_source: "ClickHouse (17 organizational cost centers & meter mappings)"
+    called_by_tools: ["get_zone_breakdown", "get_zone_cost_center_energy", "get_zone_hourly_profile", "get_breakdown_summary"]
+
+  - service_class: "TariffService"
+    location: "yamaha_chatbot_backend/src/services/tariff_service.py"
+    data_source: "ClickHouse (hourly incomer readings) + tariff HT_1 TOD schedules"
+    called_by_tools: ["get_cost_and_tariff", "create_breakdown_chart", "create_visualization"]
+
+  - service_class: "RCAService"
+    location: "yamaha_chatbot_backend/src/services/rca_service.py"
+    data_source: "ClickHouse (multi-meter historical baselines and raw high-frequency readings)"
+    called_by_tools: ["diagnose_high_consumption", "diagnose_spikes_and_anomalies", "explain_hourly_anomaly"]
+
+  - service_class: "AggregationService"
+    location: "yamaha_chatbot_backend/src/services/aggregation_service.py"
+    data_source: "ClickHouse (tag_daily_energy_rollup & opcda_readings)"
+    called_by_tools: ["create_visualization", "aggregate_energy_telemetry"]
+
+  - service_class: "ChatRepository"
+    location: "yamaha_chatbot_backend/src/db/chat_history.py"
+    data_source: "SQLite (yamaha_mock.db)"
+    called_by_tools: ["get_realtime_device_telemetry"]
+
+  - service_class: "EMSKnowledgeBase"
+    location: "yamaha_chatbot_backend/src/rag/retriever.py"
+    data_source: "energy-ai-assistant-reference.md, EMS_DATA_COMPONENTS_AND_RULES.md, docs/components/*.md"
+    called_by_tools: ["search_ems_knowledge_base"]

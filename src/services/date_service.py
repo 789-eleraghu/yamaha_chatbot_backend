@@ -48,18 +48,14 @@ class DateService:
     @staticmethod
     def get_db_date_bounds() -> Tuple[Optional[str], Optional[str]]:
         """
-        Query the telemetry database for min and max available dates.
+        Query the ClickHouse telemetry database for min and max available dates.
         Returns (min_date, max_date) as 'YYYY-MM-DD' strings.
         """
         try:
-            import sqlite3
-            conn = sqlite3.connect(settings.SQLITE_DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("SELECT MIN(date), MAX(date) FROM tag_daily_energy_rollup;")
-            row = cursor.fetchone()
-            conn.close()
-            if row and row[0] and row[1]:
-                return row[0], row[1]
+            from src.db.client import db_client
+            rows = db_client.execute_query("SELECT toString(min(day)) as min_d, toString(max(day)) as max_d FROM tag_daily_energy_rollup;")
+            if rows and rows[0].get("min_d") and rows[0].get("max_d"):
+                return str(rows[0]["min_d"]), str(rows[0]["max_d"])
         except Exception:
             pass
         # Fallback to known telemetry boundaries if DB unreachable

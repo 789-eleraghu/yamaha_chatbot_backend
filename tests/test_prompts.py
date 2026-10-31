@@ -1,5 +1,10 @@
 """
 Unit Tests for System Prompt Generation and Constitutional Invariants
+
+NOTE: Security-related assertions (domain lock, anti-leak, rule immutability) were
+removed after migrating to NeMo-style Guardrails. These are now enforced by:
+- src/guardrails/guardrails_service.py (input/output rails)
+- tests/test_guardrails.py (dedicated guardrails tests)
 """
 
 import pytest
@@ -8,22 +13,19 @@ from src.agent.prompts import get_system_prompt, SYSTEM_PROMPT
 def test_system_prompt_integrity():
     prompt = get_system_prompt()
     assert prompt is not None
-    assert len(prompt) > 2000
+    assert len(prompt) > 1500  # Reduced due to guardrails refactor
 
-    # 1. Identity & Strict Domain Lock
+    # 1. Identity & Domain Expertise
     assert "Yamaha Industrial Energy AI Assistant" in prompt
-    assert "STRICT DOMAIN LOCK" in prompt
-    assert "NEVER deviate from the energy intelligence task" in prompt
+    assert "Domain Expertise" in prompt or "industrial energy management" in prompt
 
     # 2. Epistemic Grounding & Zero Outside Assumptions
     assert "EPISTEMIC GROUNDING" in prompt
     assert "No General Common Knowledge for EMS Facts" in prompt
     assert "analytical and mathematical deduction engine" in prompt
 
-    # 3. Rule Immutability & Anti-Leak Protection
-    assert "CANNOT BE OVERRIDDEN" in prompt or "Rule Immutability" in prompt
-    assert "Confidentiality & Anti-Leak" in prompt
-    assert "proprietary and confidential" in prompt
+    # 3. Security handled by NeMo Guardrails - see tests/test_guardrails.py
+    # Rule Immutability, Confidentiality & Anti-Leak removed from prompt
 
     # 4. Adaptive Communication & Depth Protocol
     assert "Start Small" in prompt

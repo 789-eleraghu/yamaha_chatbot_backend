@@ -11,6 +11,10 @@ from src.db.chat_history import chat_repo
 
 class UserContext(BaseModel):
     user_id: str
+    consumer_id: int = 1
+    email: Optional[str] = None
+    name: Optional[str] = None
+    role: str = "user"
     is_authenticated: bool = True
 
 class AuthorizationService:
@@ -43,6 +47,13 @@ class AuthorizationService:
         Verify that the chat exists and belongs to the given user.
         Raises 404 if chat doesn't exist, 403 if user is not the owner.
         """
+        from src.db.chat_history import is_valid_uuid
+        if not is_valid_uuid(chat_id):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Chat '{chat_id}' not found."
+            )
+
         clean_chat_id = cls.sanitize_identifier(chat_id, "chat_id")
         clean_user_id = cls.sanitize_identifier(user_id, "user_id")
 
@@ -56,13 +67,15 @@ class AuthorizationService:
         chat_owner = chat.get("user_id")
         if chat_owner:
             # Cross-user access check: Prevent tenant contamination
-            if clean_user_id != "default_user" and chat_owner != clean_user_id:
+            from src.core.config import settings
+            is_dev = settings.ENVIRONMENT in ("development", "test")
+            dev_compatible = is_dev and (clean_user_id in ("default_user", "dev_user_1") or chat_owner == "default_user")
+            if not dev_compatible and clean_user_id != "default_user" and chat_owner != clean_user_id:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail=f"Access denied: You do not have permission to {action} this conversation."
                 )
-            from src.core.config import settings
-            if settings.ENVIRONMENT not in ("development", "test") and clean_user_id != chat_owner:
+            if not is_dev and clean_user_id != chat_owner:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail=f"Access denied: Authenticated user mismatch for conversation '{clean_chat_id}'."

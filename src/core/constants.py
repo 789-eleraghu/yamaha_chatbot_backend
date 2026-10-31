@@ -35,6 +35,12 @@ DG_ENERGY_TAG = f"{DG_DEVICE_PREFIX}Energies/Real Energy/Real Energy Into the Lo
 DG_POWER_TAG = f"{DG_DEVICE_PREFIX}Powers/Real Power/Real Power Total"
 DG_RUN_THRESHOLD_KW = 1.0
 
+# Solar Generation Constants
+SOLAR_DEVICE_PREFIX = "Incomer.Incomer_Solar_100kW/"
+SOLAR_ENERGY_TAG = f"{SOLAR_DEVICE_PREFIX}Energies/Real Energy/Real Energy Absolute"
+SOLAR_POWER_TAG = f"{SOLAR_DEVICE_PREFIX}Powers/Real Power/Real Power Total"
+SOLAR_CAPACITY_KW = 100.0
+
 # Power Quality & THD Limits (Section 6)
 VOLTAGE_THD_LIMIT_PERCENT = 5.0
 CURRENT_THD_LIMIT_PERCENT = 8.0

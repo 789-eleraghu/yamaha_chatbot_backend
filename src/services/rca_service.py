@@ -6,6 +6,8 @@ Answers:
 - 'What went wrong at 15:00?'
 - 'Explain Shift C night baseload leaks and power quality excursions.'
 Retrieves granular telemetry from opcda_readings to provide physical engineering deductions.
+
+Uses native ClickHouse queries for production database.
 """
 
 import datetime
@@ -23,13 +25,14 @@ from src.core.constants import (
     VOLTAGE_THD_TAGS,
 )
 from src.core.normalizers import normalize_date_str
-from src.db.sqlite_client import db_client
-from src.services.breakdown_service import BreakdownService
-from src.services.demand_service import DemandService
-from src.services.energy_service import EnergyService
-from src.services.power_quality_service import PowerQualityService
-from src.services.shift_service import ShiftService
+from src.db.client import db_client
 from src.services.tariff_service import TariffService
+from src.services.telemetry import (
+    equipments_telemetry,
+    facility_telemetry,
+    zones_telemetry,
+)
+
 
 class RCAService:
     @staticmethod
@@ -42,34 +45,38 @@ class RCAService:
         4. Cross-reference peak demand excursions
         """
         date_str = normalize_date_str(date_str)
-        target_energy = EnergyService.get_facility_daily_energy(date_str)
+        target_energy = facility_telemetry.get_grid_energy(date_str)
         day_kwh = target_energy.get("energy_kwh") or 0.0
 
         target_dt = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
         weekday = target_dt.weekday()
 
-        # Query past days for baseline
+        # ClickHouse query for baseline history
         q_history = """
-            SELECT date, energy
+            SELECT
+                toString(day) as date,
+                maxMerge(max_value) - minMerge(min_value) as energy
             FROM tag_daily_energy_rollup
-            WHERE tag_id = ? AND date < ?
-            ORDER BY date DESC
+            WHERE tag_id = {tag_id:String}
+              AND day < toDate({date:String})
+            GROUP BY day
+            ORDER BY day DESC
             LIMIT 30;
         """
-        history_rows = db_client.execute_query(q_history, (SHIFT_ENERGY_TAG, date_str))
-        
+        history_rows = db_client.execute_query(q_history, {"tag_id": SHIFT_ENERGY_TAG, "date": date_str})
+
         same_day_vals = [
-            float(r["energy"]) for r in history_rows 
-            if datetime.datetime.strptime(r["date"], "%Y-%m-%d").date().weekday() == weekday
+            float(r["energy"]) for r in history_rows
+            if datetime.datetime.strptime(str(r["date"]), "%Y-%m-%d").date().weekday() == weekday
         ]
         baseline_kwh = round(sum(same_day_vals) / len(same_day_vals), 1) if same_day_vals else day_kwh
         variance_kwh = round(day_kwh - baseline_kwh, 1)
         variance_pct = round((variance_kwh / baseline_kwh) * 100.0, 1) if baseline_kwh > 0 else 0.0
 
-        equipment_breakdown = BreakdownService.get_equipment_wise_breakdown(date_str)
-        cost_center_breakdown = BreakdownService.get_zone_wise_cost_centers(date_str)
-        shift_data = ShiftService.get_shift_consumption(date_str)
-        demand_data = DemandService.get_peak_demand_analysis(date_str)
+        equipment_breakdown = equipments_telemetry.get_category_breakdown(date_str)
+        cost_center_breakdown = zones_telemetry.get_zone_breakdown(date_str)
+        shift_data = facility_telemetry.get_grid_shift_energy(date_str)
+        demand_data = facility_telemetry.get_peak_demand(date_str)
 
         top_categories = equipment_breakdown.get("categories", [])[:3]
         top_cost_centers = cost_center_breakdown.get("cost_centers", [])[:3]
@@ -97,7 +104,7 @@ class RCAService:
 
     @staticmethod
     def detect_and_explain_spikes(
-        date_str: str, 
+        date_str: str,
         anomaly_type: str = "all"
     ) -> Dict[str, Any]:
         """
@@ -116,7 +123,7 @@ class RCAService:
         # 1. Peak Demand Spikes & Excursions
         # ---------------------------------------------------------
         if anomaly_type in ("all", "peak_demand"):
-            demand_info = DemandService.get_peak_demand_analysis(date_str)
+            demand_info = facility_telemetry.get_peak_demand(date_str)
             peak_kva = demand_info.get("peak_kva") or 0.0
             excursions = demand_info.get("excursion_events") or []
 
@@ -175,7 +182,7 @@ class RCAService:
                 if max_kwh > (1.25 * mean_kwh) and max_kwh > 500:
                     spike_hour_num = int(max_hour_label.split(":")[0])
                     hourly_diag = RCAService.explain_hourly_anomaly(date_str, spike_hour_num)
-                    
+
                     diag_text = (
                         f"HOURLY LOAD SPIKE: Hour {max_hour_label} surged to {max_kwh:,.1f} kWh "
                         f"({round(((max_kwh - mean_kwh) / mean_kwh) * 100, 1)}% above daily average {round(mean_kwh, 1)} kWh/hr). "
@@ -196,13 +203,13 @@ class RCAService:
         # 3. Shift C Baseload Leaks (00:40 to 08:00)
         # ---------------------------------------------------------
         if anomaly_type in ("all", "shift_c_baseload"):
-            shift_info = ShiftService.get_shift_consumption(date_str)
+            shift_info = facility_telemetry.get_grid_shift_energy(date_str)
             shift_c_kwh = shift_info.get("shift_c_kwh") or 0.0
             shift_a_kwh = shift_info.get("shift_a_kwh") or 0.0
-            
+
             # Shift C duration = 7h 20m = 7.333 hours
             shift_c_rate = shift_c_kwh / 7.333 if shift_c_kwh > 0 else 0.0
-            
+
             # Anomaly: Shift C average rate > 65% of Shift A day rate or > 1200 kWh/hr
             shift_a_rate = shift_a_kwh / 9.0 if shift_a_kwh > 0 else 0.0
             if shift_c_rate > 1200 or (shift_a_rate > 0 and (shift_c_rate / shift_a_rate) > 0.65):
@@ -228,7 +235,7 @@ class RCAService:
         # 4. Power Quality (THD & Power Factor)
         # ---------------------------------------------------------
         if anomaly_type in ("all", "power_quality"):
-            thd_info = PowerQualityService.get_thd_analysis(date_str)
+            thd_info = facility_telemetry.get_thd_analysis(date_str)
             max_v_thd = thd_info.get("voltage_thd", {}).get("max_percent") or 0.0
             max_c_thd = thd_info.get("current_thd", {}).get("max_percent") or 0.0
 
@@ -256,18 +263,28 @@ class RCAService:
                     "explanation": msg
                 })
 
-            # Check min PF
+            # Check min PF with ClickHouse
             pf_tag = "HT_Room.South_Utilities_1000kVA_Transformer/Power Factors/Power Factor Total/Power Factor Total"
             q_pf = """
-                SELECT MIN(value / 100.0) as min_pf, reading_timestamp
+                SELECT
+                    MIN(toFloat64OrNull(value) / 100.0) as min_pf,
+                    any(opcda_readings.reading_timestamp) as reading_timestamp
                 FROM opcda_readings
-                WHERE tag_id = ? AND reading_timestamp >= ? AND reading_timestamp <= ? AND value > 0;
+                WHERE tag_id = {tag_id:String}
+                  AND opcda_readings.reading_timestamp >= parseDateTimeBestEffort({start_ts:String})
+                  AND opcda_readings.reading_timestamp <= parseDateTimeBestEffort({end_ts:String})
+                  AND toFloat64OrNull(opcda_readings.value) > 0;
             """
-            pf_rows = db_client.execute_query(q_pf, (pf_tag, f"{date_str} 00:00:00", f"{date_str} 23:59:59"))
+            pf_rows = db_client.execute_query(q_pf, {
+                "tag_id": pf_tag,
+                "start_ts": f"{date_str} 00:00:00",
+                "end_ts": f"{date_str} 23:59:59"
+            })
             if pf_rows and pf_rows[0]["min_pf"] is not None:
                 min_pf = round(float(pf_rows[0]["min_pf"]), 3)
                 if min_pf < 0.90:
-                    pf_time = pf_rows[0]["reading_timestamp"][11:16]
+                    ts_str = str(pf_rows[0]["reading_timestamp"])
+                    pf_time = ts_str[11:16] if len(ts_str) > 16 else "unknown"
                     msg = f"POWER FACTOR SAG: Power factor dropped to {min_pf} at {pf_time} IST (below 0.90 target)."
                     findings_summary.append(msg)
                     anomalies_found.append({
@@ -283,19 +300,34 @@ class RCAService:
         # 5. Steam Utility Surges
         # ---------------------------------------------------------
         if anomaly_type in ("all", "steam"):
-            q_steam = """
-                SELECT MAX(value) as max_flow, MIN(value) as min_press
+            # Steam flow query
+            q_flow = """
+                SELECT MAX(toFloat64OrNull(value)) as val
                 FROM opcda_readings
-                WHERE tag_id IN (?, ?) AND reading_timestamp >= ? AND reading_timestamp <= ?;
+                WHERE tag_id = {tag_id:String}
+                  AND reading_timestamp >= parseDateTimeBestEffort({start_ts:String})
+                  AND reading_timestamp <= parseDateTimeBestEffort({end_ts:String});
             """
-            s_rows = db_client.execute_query(q_steam, (
-                STEAM_FLOW_RATE_TAG, STEAM_PRESSURE_TAG, f"{date_str} 00:00:00", f"{date_str} 23:59:59"
-            ))
-            # Individual queries for flow and pressure
-            q_flow = f"SELECT MAX(value) as val FROM opcda_readings WHERE tag_id = '{STEAM_FLOW_RATE_TAG}' AND reading_timestamp >= ? AND reading_timestamp <= ?"
-            q_pres = f"SELECT MIN(value) as val FROM opcda_readings WHERE tag_id = '{STEAM_PRESSURE_TAG}' AND reading_timestamp >= ? AND reading_timestamp <= ? AND value > 0"
-            f_res = db_client.execute_query(q_flow, (f"{date_str} 00:00:00", f"{date_str} 23:59:59"))
-            p_res = db_client.execute_query(q_pres, (f"{date_str} 00:00:00", f"{date_str} 23:59:59"))
+            f_res = db_client.execute_query(q_flow, {
+                "tag_id": STEAM_FLOW_RATE_TAG,
+                "start_ts": f"{date_str} 00:00:00",
+                "end_ts": f"{date_str} 23:59:59"
+            })
+
+            # Steam pressure query
+            q_pres = """
+                SELECT MIN(toFloat64OrNull(value)) as val
+                FROM opcda_readings
+                WHERE tag_id = {tag_id:String}
+                  AND reading_timestamp >= parseDateTimeBestEffort({start_ts:String})
+                  AND reading_timestamp <= parseDateTimeBestEffort({end_ts:String})
+                  AND toFloat64OrNull(value) > 0;
+            """
+            p_res = db_client.execute_query(q_pres, {
+                "tag_id": STEAM_PRESSURE_TAG,
+                "start_ts": f"{date_str} 00:00:00",
+                "end_ts": f"{date_str} 23:59:59"
+            })
 
             max_f = round(float(f_res[0]["val"]), 1) if f_res and f_res[0]["val"] is not None else 0.0
             min_p = round(float(p_res[0]["val"]), 2) if p_res and p_res[0]["val"] is not None else 0.0
@@ -351,38 +383,45 @@ class RCAService:
         facility_kwh = db_client.get_tag_delta(SHIFT_ENERGY_TAG, start_ts, end_ts) or 0.0
         facility_kwh = round(facility_kwh, 1)
 
-        # Peak kVA in hour
-        q_peak = f"""
-            SELECT MAX(value) as max_kva, AVG(value) as avg_kva
+        # Peak kVA in hour - ClickHouse query
+        q_peak = """
+            SELECT
+                MAX(toFloat64OrNull(value)) as max_kva,
+                AVG(toFloat64OrNull(value)) as avg_kva
             FROM opcda_readings
-            WHERE tag_id = ? AND reading_timestamp >= ? AND reading_timestamp <= ?;
+            WHERE tag_id = {tag_id:String}
+              AND reading_timestamp >= parseDateTimeBestEffort({start_ts:String})
+              AND reading_timestamp <= parseDateTimeBestEffort({end_ts:String});
         """
-        peak_row = db_client.execute_query(q_peak, (PEAK_DEMAND_TAG, start_ts, end_ts))
+        peak_row = db_client.execute_query(q_peak, {"tag_id": PEAK_DEMAND_TAG, "start_ts": start_ts, "end_ts": end_ts})
         max_kva = round(float(peak_row[0]["max_kva"]), 1) if peak_row and peak_row[0]["max_kva"] else 0.0
         avg_kva = round(float(peak_row[0]["avg_kva"]), 1) if peak_row and peak_row[0]["avg_kva"] else 0.0
 
-        # Category breakdown in hour
-        placeholders = ', '.join(['?'] * len(CATEGORY_EXCLUDED_TAGS))
+        # Category breakdown in hour - ClickHouse query
+        excluded_list = ", ".join(f"'{t}'" for t in CATEGORY_EXCLUDED_TAGS)
         q_cat = f"""
-            SELECT SUBSTR(tag_id, 1, INSTR(tag_id, '.') - 1) as category, 
-                   ROUND(SUM(delta), 1) as category_kwh
+            SELECT
+                splitByChar('.', tag_id)[1] as category,
+                ROUND(SUM(delta), 1) as category_kwh
             FROM (
-                SELECT tag_id, MAX(value) - MIN(value) as delta
+                SELECT
+                    tag_id,
+                    max(toFloat64OrNull(value)) - min(toFloat64OrNull(value)) as delta
                 FROM opcda_readings
-                WHERE reading_timestamp >= ? AND reading_timestamp <= ?
+                WHERE reading_timestamp >= parseDateTimeBestEffort({{start_ts:String}})
+                  AND reading_timestamp <= parseDateTimeBestEffort({{end_ts:String}})
                   AND tag_id LIKE '%Energies/Real Energy/Real Energy Into the Load'
-                  AND tag_id NOT IN ({placeholders})
-                  AND tag_id NOT LIKE 'HT_Room%'
-                  AND tag_id NOT LIKE 'Incomer.%'
+                  AND tag_id NOT IN ({excluded_list})
+                  AND NOT startsWith(tag_id, 'HT_Room')
+                  AND NOT startsWith(tag_id, 'Incomer.')
                 GROUP BY tag_id
                 HAVING delta > 0
             )
             GROUP BY category
             ORDER BY category_kwh DESC;
         """
-        cat_params = [start_ts, end_ts] + list(CATEGORY_EXCLUDED_TAGS)
-        cat_rows = db_client.execute_query(q_cat, cat_params)
-        
+        cat_rows = db_client.execute_query(q_cat, {"start_ts": start_ts, "end_ts": end_ts})
+
         categories = [
             {"category": r["category"], "kwh": float(r["category_kwh"])}
             for r in cat_rows if r["category"]
@@ -393,16 +432,17 @@ class RCAService:
         # Top 5 machinery devices in hour
         top_devices = RCAService._get_top_active_devices_in_window(start_ts, end_ts, limit=5)
 
-        # Power quality in hour
+        # Power quality in hour - ClickHouse query
         q_pq = f"""
-            SELECT 
-                ROUND(AVG(CASE WHEN tag_id = '{VOLTAGE_THD_TAGS[3]}' THEN value END), 2) as avg_v_thd,
-                ROUND(AVG(CASE WHEN tag_id = '{CURRENT_THD_TAGS[0]}' THEN value END), 2) as avg_c_thd,
-                ROUND(AVG(CASE WHEN tag_id LIKE '%Power Factor Total/Power Factor Total%' THEN value / 100.0 END), 3) as avg_pf
+            SELECT
+                ROUND(AVG(CASE WHEN tag_id = '{VOLTAGE_THD_TAGS[3]}' THEN toFloat64OrNull(value) END), 2) as avg_v_thd,
+                ROUND(AVG(CASE WHEN tag_id = '{CURRENT_THD_TAGS[0]}' THEN toFloat64OrNull(value) END), 2) as avg_c_thd,
+                ROUND(AVG(CASE WHEN tag_id LIKE '%Power Factor Total/Power Factor Total%' THEN toFloat64OrNull(value) / 100.0 END), 3) as avg_pf
             FROM opcda_readings
-            WHERE reading_timestamp >= ? AND reading_timestamp <= ?;
+            WHERE reading_timestamp >= parseDateTimeBestEffort({{start_ts:String}})
+              AND reading_timestamp <= parseDateTimeBestEffort({{end_ts:String}});
         """
-        pq_row = db_client.execute_query(q_pq, (start_ts, end_ts))
+        pq_row = db_client.execute_query(q_pq, {"start_ts": start_ts, "end_ts": end_ts})
         avg_v_thd = pq_row[0]["avg_v_thd"] if pq_row else None
         avg_c_thd = pq_row[0]["avg_c_thd"] if pq_row else None
         avg_pf = pq_row[0]["avg_pf"] if pq_row else None
@@ -437,22 +477,24 @@ class RCAService:
     @staticmethod
     def _get_top_active_devices_in_window(start_ts: str, end_ts: str, limit: int = 5) -> List[Dict[str, Any]]:
         """Helper to find top individual equipment devices consuming energy in a time window."""
-        placeholders = ', '.join(['?'] * len(CATEGORY_EXCLUDED_TAGS))
+        excluded_list = ", ".join(f"'{t}'" for t in CATEGORY_EXCLUDED_TAGS)
         q = f"""
-            SELECT tag_id, MAX(value) - MIN(value) as delta
+            SELECT
+                tag_id,
+                max(toFloat64OrNull(value)) - min(toFloat64OrNull(value)) as delta
             FROM opcda_readings
-            WHERE reading_timestamp >= ? AND reading_timestamp <= ?
+            WHERE reading_timestamp >= parseDateTimeBestEffort({{start_ts:String}})
+              AND reading_timestamp <= parseDateTimeBestEffort({{end_ts:String}})
               AND tag_id LIKE '%Energies/Real Energy/Real Energy Into the Load'
-              AND tag_id NOT IN ({placeholders})
-              AND tag_id NOT LIKE 'HT_Room%'
-              AND tag_id NOT LIKE 'Incomer.%'
+              AND tag_id NOT IN ({excluded_list})
+              AND NOT startsWith(tag_id, 'HT_Room')
+              AND NOT startsWith(tag_id, 'Incomer.')
             GROUP BY tag_id
             HAVING delta > 0
             ORDER BY delta DESC
-            LIMIT {limit};
+            LIMIT {{limit:Int32}};
         """
-        params = [start_ts, end_ts] + list(CATEGORY_EXCLUDED_TAGS)
-        rows = db_client.execute_query(q, params)
+        rows = db_client.execute_query(q, {"start_ts": start_ts, "end_ts": end_ts, "limit": limit})
 
         results = []
         for r in rows:

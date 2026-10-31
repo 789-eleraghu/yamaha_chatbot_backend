@@ -138,7 +138,8 @@ async def test_async_database_methods():
     from src.db.chat_history import chat_repo
     from src.services.chat_service import chat_service
 
-    test_cid = "test_async_db_chat"
+    import uuid
+    test_cid = str(uuid.uuid4())
     chat = await chat_repo.create_chat_async(user_id="test_user", name="Async Test Chat", chat_id=test_cid)
     assert chat["chat_id"] == test_cid
 
